@@ -87,15 +87,18 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
+
+def mostrar_estado(aprobado, texto):
+    clase = "status-pass" if aprobado else "status-fail"
+    icono = "✅" if aprobado else "❌"
+    html = f'<div class="{clase}">{icono} {texto}</div>'
+    st.markdown(html, unsafe_allow_html=True)
+
+
 # =====================================================================
 # 2. LECTOR DE ARCHIVOS CAD EN MILÍMETROS (.DXF y .IGS / .IGES)
 # =====================================================================
 def merge_nodes_and_elements(raw_lines, scale_factor=1.0, swap_yz=False, tol_mm=1.5):
-    """
-    Convierte los segmentos crudos del CAD aplicando primero el factor de escala
-    para que todas las coordenadas queden estrictamente en MILÍMETROS (mm)
-    antes de fusionar nodos cercanos con tolerancia tol_mm.
-    """
     nodes = []
     elements = []
 
@@ -111,7 +114,6 @@ def merge_nodes_and_elements(raw_lines, scale_factor=1.0, swap_yz=False, tol_mm=
         p2_arr = np.array(p2, dtype=float) * scale_factor
 
         if swap_yz:
-            # Si viene de SolidWorks (Y arriba), pasamos Y -> Z vertical
             p1_arr = np.array([p1_arr[0], p1_arr[2], p1_arr[1]])
             p2_arr = np.array([p2_arr[0], p2_arr[2], p2_arr[1]])
 
@@ -126,17 +128,13 @@ def merge_nodes_and_elements(raw_lines, scale_factor=1.0, swap_yz=False, tol_mm=
 
     nodes_arr = np.array(nodes, dtype=float)
 
-    # Asegurar que el eje más largo del chasis quede alineado como X longitudinal
     if len(nodes_arr) >= 4:
         spans = np.ptp(nodes_arr, axis=0)
         if spans[1] > spans[0] and spans[1] > spans[2]:
-            # Si el chasis está orientado a lo largo del eje Y, rotamos X <-> Y
             nodes_arr = nodes_arr[:, [1, 0, 2]]
         elif spans[2] > spans[0] and spans[2] > spans[1]:
-            # Si el chasis está orientado a lo largo del eje Z, rotamos X <-> Z
             nodes_arr = nodes_arr[:, [2, 1, 0]]
 
-        # Centrar Y (lateral) en 0 y poner Z mínimo (piso del chasis) en 0 mm
         nodes_arr[:, 0] -= nodes_arr[:, 0].min()
         nodes_arr[:, 1] -= 0.5 * (nodes_arr[:, 1].max() + nodes_arr[:, 1].min())
         nodes_arr[:, 2] -= nodes_arr[:, 2].min()
@@ -177,15 +175,9 @@ def parse_dxf(content_str, scale_factor=1.0, swap_yz=False, tol_mm=1.5):
 
 
 def parse_iges(content_str, scale_factor=1.0, swap_yz=False, tol_mm=1.5):
-    """
-    Lee entidades de curva 3D en archivos .IGS / .IGES:
-    - Tipo 110: Line Entity
-    - Tipo 126: Rational B-Spline Curve (líneas y arcos exportados como NURBS)
-    - Tipo 106: Copious Data (polilíneas 3D)
-    """
     p_lines = []
     for line in content_str.splitlines():
-        if len(line) >= 73 and line[72] == 'P':
+        if len(line) >= 73 and line[72] == "P":
             p_lines.append(line[:64].strip())
 
     full_p_text = "".join(p_lines)
@@ -193,7 +185,8 @@ def parse_iges(content_str, scale_factor=1.0, swap_yz=False, tol_mm=1.5):
 
     raw_segments = []
     for rec in records:
-        parts = [p.strip().replace('D', 'E').replace('d', 'e') for p in rec.split(",") if p.strip()]
+        clean_rec = rec.replace("D", "E").replace("d", "e")
+        parts = [p.strip() for p in clean_rec.split(",") if p.strip()]
         if not parts:
             continue
         try:
@@ -210,8 +203,12 @@ def parse_iges(content_str, scale_factor=1.0, swap_yz=False, tol_mm=1.5):
                 start_cp = 7 + (A + 1) + (K + 1)
                 end_cp = start_cp + 3 * K
                 if len(parts) > end_cp + 2:
-                    x1, y1, z1 = float(parts[start_cp]), float(parts[start_cp+1]), float(parts[start_cp+2])
-                    x2, y2, z2 = float(parts[end_cp]), float(parts[end_cp+1]), float(parts[end_cp+2])
+                    x1 = float(parts[start_cp])
+                    y1 = float(parts[start_cp + 1])
+                    z1 = float(parts[start_cp + 2])
+                    x2 = float(parts[end_cp])
+                    y2 = float(parts[end_cp + 1])
+                    z2 = float(parts[end_cp + 2])
                     raw_segments.append(([x1, y1, z1], [x2, y2, z2]))
             elif ent_type == 106 and len(parts) >= 9:
                 ip = int(float(parts[1]))
@@ -219,12 +216,12 @@ def parse_iges(content_str, scale_factor=1.0, swap_yz=False, tol_mm=1.5):
                 if ip == 2 and len(parts) >= 3 + 3 * n_pts:
                     pts = []
                     for k in range(n_pts):
-                        px = float(parts[3 + 3*k])
-                        py = float(parts[4 + 3*k])
-                        pz = float(parts[5 + 3*k])
+                        px = float(parts[3 + 3 * k])
+                        py = float(parts[4 + 3 * k])
+                        pz = float(parts[5 + 3 * k])
                         pts.append([px, py, pz])
                     for k in range(len(pts) - 1):
-                        raw_segments.append((pts[k], pts[k+1]))
+                        raw_segments.append((pts[k], pts[k + 1]))
         except (ValueError, IndexError):
             continue
 
@@ -232,7 +229,6 @@ def parse_iges(content_str, scale_factor=1.0, swap_yz=False, tol_mm=1.5):
 
 
 def generate_reference_fsae_chassis():
-    """Chasis de referencia íntegramente en MILÍMETROS (mm)."""
     nodes = np.array([
         [0, -190, 20],    [0, 190, 20],     [0, 190, 360],    [0, -190, 360],
         [520, -220, 0],   [520, 220, 0],    [520, 238, 420],  [520, -238, 420],
@@ -278,6 +274,7 @@ def generate_reference_fsae_chassis():
             unique_elems.append(edge)
     return nodes, unique_elems
 
+
 # =====================================================================
 # 3. MOTOR DE ELEMENTOS FINITOS 3D EN MILÍMETROS (N, mm, MPa)
 # =====================================================================
@@ -301,15 +298,8 @@ def beam_3d_transformation_matrix(p1, p2):
         T[3*i:3*i+3, 3*i:3*i+3] = r
     return T, L
 
+
 def beam_3d_local_stiffness(E, G, A, Iy, Iz, J, L):
-    """
-    Unidades de entrada:
-    - E, G en MPa (N/mm²)
-    - A en mm²
-    - Iy, Iz, J en mm⁴
-    - L en mm
-    Unidades de salida: Fuerzas en N, Momentos en N·mm, Desplazamientos en mm.
-    """
     k = np.zeros((12, 12))
     EA_L = E * A / L
     GJ_L = G * J / L
@@ -335,23 +325,24 @@ def beam_3d_local_stiffness(E, G, A, Iy, Iz, J, L):
 
     return k
 
+
 def solve_frame_3d(nodes, elements, prop_dict, fixed_dofs, nodal_loads):
     n_nodes = len(nodes)
     ndof = 6 * n_nodes
     K_global = np.zeros((ndof, ndof))
     F_global = np.zeros(ndof)
 
-    E = prop_dict["E"]          # MPa (N/mm²)
-    G = prop_dict["G"]          # MPa (N/mm²)
-    D = prop_dict["OD"]         # mm
-    t = prop_dict["t"]          # mm
-    rho = prop_dict["rho"]      # kg/mm³
+    E = prop_dict["E"]
+    G = prop_dict["G"]
+    D = prop_dict["OD"]
+    t = prop_dict["t"]
+    rho = prop_dict["rho"]
 
     d_in = max(D - 2.0 * t, 0.1)
-    A = (math.pi / 4.0) * (D**2 - d_in**2)          # mm²
-    I = (math.pi / 64.0) * (D**4 - d_in**4)         # mm⁴
-    J = 2.0 * I                                     # mm⁴
-    c_outer = D / 2.0                               # mm
+    A = (math.pi / 4.0) * (D**2 - d_in**2)
+    I = (math.pi / 64.0) * (D**4 - d_in**4)
+    J = 2.0 * I
+    c_outer = D / 2.0
 
     elem_cache = []
     total_length_mm = 0.0
@@ -374,7 +365,6 @@ def solve_frame_3d(nodes, elements, prop_dict, fixed_dofs, nodal_loads):
         for j in range(min(len(force_vec), 6)):
             F_global[6 * node_id + j] += force_vec[j]
 
-    # Regularización numérica para evitar singularidades en nodos coplanares del CAD
     K_global += np.eye(ndof) * 1e-2
     free_dofs = np.setdiff1d(np.arange(ndof), np.unique(fixed_dofs))
     U = np.zeros(ndof)
@@ -387,7 +377,6 @@ def solve_frame_3d(nodes, elements, prop_dict, fixed_dofs, nodal_loads):
     except np.linalg.LinAlgError:
         U[free_dofs] = np.linalg.lstsq(K_ff, F_f, rcond=None)[0]
 
-    # Desplazamientos directamente en MILÍMETROS (mm)
     u_xyz_mm = U.reshape((n_nodes, 6))[:, :3]
     disp_mag_mm = np.linalg.norm(u_xyz_mm, axis=1)
 
@@ -423,6 +412,7 @@ def solve_frame_3d(nodes, elements, prop_dict, fixed_dofs, nodal_loads):
         "I_mm4": I
     }
 
+
 # =====================================================================
 # 4. GENERADOR DE ESCENARIOS DE PRUEBA (FSAE 2026 + REFERENCIA)
 # =====================================================================
@@ -438,11 +428,13 @@ def identify_key_regions(nodes):
     if len(front_bulkhead) < 2:
         front_bulkhead = np.argsort(x)[:4]
 
-    front_susp = np.where((x >= x_min + 0.15 * L_total) & (x <= x_min + 0.38 * L_total) & (z <= z_min + 0.45 * H_total))[0]
+    cond_fs = (x >= x_min + 0.15 * L_total) & (x <= x_min + 0.38 * L_total) & (z <= z_min + 0.45 * H_total)
+    front_susp = np.where(cond_fs)[0]
     if len(front_susp) < 2:
         front_susp = np.argsort(np.abs(x - (x_min + 0.25 * L_total)))[:4]
 
-    cockpit_nodes = np.where((x >= x_min + 0.40 * L_total) & (x <= x_min + 0.72 * L_total) & (z <= z_min + 0.55 * H_total))[0]
+    cond_ck = (x >= x_min + 0.40 * L_total) & (x <= x_min + 0.72 * L_total) & (z <= z_min + 0.55 * H_total)
+    cockpit_nodes = np.where(cond_ck)[0]
     if len(cockpit_nodes) < 2:
         cockpit_nodes = np.argsort(np.abs(x - (x_min + 0.55 * L_total)))[:6]
 
@@ -450,11 +442,13 @@ def identify_key_regions(nodes):
     if len(main_hoop_top) < 1:
         main_hoop_top = np.argsort(z)[-2:]
 
-    engine_nodes = np.where((x >= x_min + 0.68 * L_total) & (x <= x_min + 0.90 * L_total) & (z <= z_min + 0.55 * H_total))[0]
+    cond_en = (x >= x_min + 0.68 * L_total) & (x <= x_min + 0.90 * L_total) & (z <= z_min + 0.55 * H_total)
+    engine_nodes = np.where(cond_en)[0]
     if len(engine_nodes) < 2:
         engine_nodes = np.argsort(np.abs(x - (x_min + 0.80 * L_total)))[:4]
 
-    rear_susp = np.where((x >= x_min + 0.78 * L_total) & (x <= x_min + 0.94 * L_total) & (z <= z_min + 0.50 * H_total))[0]
+    cond_rs = (x >= x_min + 0.78 * L_total) & (x <= x_min + 0.94 * L_total) & (z <= z_min + 0.50 * H_total)
+    rear_susp = np.where(cond_rs)[0]
     if len(rear_susp) < 2:
         rear_susp = np.argsort(x)[-6:-2]
 
@@ -471,6 +465,7 @@ def identify_key_regions(nodes):
         "rear_susp": rear_susp,
         "jacking": jacking_nodes
     }
+
 
 def build_test_case(test_name, nodes, regions, params):
     fixed_dofs = []
@@ -501,7 +496,6 @@ def build_test_case(test_name, nodes, regions, params):
             left_nodes = regions["front_susp"][:max(half, 1)]
             right_nodes = regions["front_susp"][max(half, 1):]
 
-        # Brazo de palanca en MILÍMETROS (mm) y Par Torsor en N·mm
         lever_arm_mm = max(abs(np.mean(nodes[left_nodes, 1]) - np.mean(nodes[right_nodes, 1])), 350.0)
         torque_Nmm = params["torque_Nm"] * 1000.0
         F_vert_N = torque_Nmm / lever_arm_mm
@@ -511,7 +505,12 @@ def build_test_case(test_name, nodes, regions, params):
         for nid in right_nodes:
             nodal_loads[nid][2] -= F_vert_N / len(right_nodes)
 
-        return fixed_dofs, nodal_loads, {"lever_arm_mm": lever_arm_mm, "left_nodes": left_nodes, "right_nodes": right_nodes}
+        meta = {
+            "lever_arm_mm": lever_arm_mm,
+            "left_nodes": left_nodes,
+            "right_nodes": right_nodes
+        }
+        return fixed_dofs, nodal_loads, meta
 
     elif test_name == "braking":
         for nid in np.concatenate([regions["front_susp"], regions["rear_susp"]]):
@@ -553,6 +552,7 @@ def build_test_case(test_name, nodes, regions, params):
         for nid in regions["main_hoop_top"]:
             nodal_loads[nid][0] += 900.0 / len(regions["main_hoop_top"])
         return fixed_dofs, nodal_loads, {}
+
 
 # =====================================================================
 # 5. RENDERIZADOR 3D INTERACTIVO EN MILÍMETROS (PLOTLY)
@@ -674,13 +674,14 @@ def plot_chassis_3d(nodes, elements, res, mode="Von Mises (MPa)", scale_def=15.0
     )
     return fig
 
+
 # =====================================================================
 # 6. INTERFAZ PRINCIPAL Y PESTAÑAS DE PRUEBAS
 # =====================================================================
 st.title("🏎️ FSAE 2026 | Analizador Estructural 3D de Chasis (mm)")
 st.markdown(
-    "Plataforma de verificación por **Elementos Finitos 3D en Milímetros (`mm`, `N`, `MPa`)** basada en el reglamento "
-    "**Formula SAE® Rules 2026** (Secciones **F.3, F.7, F.8, T.2, T.3, VE.2, IN.11**)."
+    "Plataforma de verificación por **Elementos Finitos 3D en Milímetros (`mm`, `N`, `MPa`)** "
+    "basada en el reglamento **Formula SAE® Rules 2026**."
 )
 
 with st.sidebar:
@@ -708,8 +709,8 @@ with st.sidebar:
     }
     cad_scale = scale_map[unit_option]
 
-    swap_yz = st.checkbox("Mi CAD usa el Eje Y como Vertical (ej. SolidWorks)", value=False)
-    tol_mm = st.number_input("Tolerancia de unión de nodos (mm)", min_value=0.1, max_value=20.0, value=1.5, step=0.5)
+    swap_yz = st.checkbox("Mi CAD usa el Eje Y como Vertical (SolidWorks)", value=False)
+    tol_mm = st.number_input("Tolerancia unión nodos (mm)", min_value=0.1, max_value=20.0, value=1.5, step=0.5)
 
     st.header("🔧 2. Tubería y Material (F.3.4)")
     tube_preset = st.selectbox(
@@ -761,18 +762,16 @@ if uploaded_file is not None:
         nodes, elements = parse_iges(raw_text, cad_scale, swap_yz, tol_mm)
 
     if len(nodes) < 4 or len(elements) < 3:
-        st.warning("⚠️ El archivo subido no contiene suficientes líneas 3D con la tolerancia actual. Se cargó el chasis FSAE de referencia en mm.")
+        st.warning("⚠️ El archivo no contiene suficientes líneas 3D válidas. Mostrando chasis de referencia.")
         nodes, elements = generate_reference_fsae_chassis()
     else:
         spans_mm = np.ptp(nodes, axis=0)
         st.success(
-            f"✅ Archivo **{uploaded_file.name}** cargado en **MILÍMETROS**: "
+            f"✅ Archivo **{uploaded_file.name}** en **MILÍMETROS**: "
             f"**{len(nodes)} nodos** y **{len(elements)} tubos** | "
-            f"Dimensiones detectadas: **Largo X = {spans_mm[0]:.1f} mm**, "
-            f"**Ancho Y = {spans_mm[1]:.1f} mm**, **Alto Z = {spans_mm[2]:.1f} mm**."
+            f"Largo X = **{spans_mm[0]:.1f} mm**, Ancho Y = **{spans_mm[1]:.1f} mm**, Alto Z = **{spans_mm[2]:.1f} mm**."
         )
 else:
-    spans_mm = np.array([2480.0, 1040.0, 1109.0])
     st.info(
         "💡 Mostrando el **Chasis Tubular FSAE de Referencia en Milímetros** "
         "(Largo: **2480 mm**, Ancho: **1040 mm**, Alto: **1109 mm**). "
@@ -803,13 +802,14 @@ tabs = st.tabs([
     "💥 6. Impacto Frontal (120 kN) y Arnés"
 ])
 
+# PESTAÑA 1: TORSIÓN
 with tabs[0]:
     col_ctrl, col_viz = st.columns([1, 2.6])
     with col_ctrl:
         st.subheader("Parámetros de Torsión")
-        torque_Nm = st.number_input("Par Torsor Aplicado M (N·m)", min_value=500.0, max_value=10000.0, value=3000.0, step=250.0)
-        target_K = st.number_input("Rigidez Objetivo (N·m/grado)", min_value=1000.0, max_value=6000.0, value=3000.0, step=100.0)
-        viz_mode_1 = st.radio("Variable a colorear en 3D:", ["Von Mises (MPa)", "Desplazamiento (mm)"], key="v1")
+        torque_Nm = st.number_input("Par Torsor M (N·m)", 500.0, 10000.0, 3000.0, 250.0)
+        target_K = st.number_input("Rigidez Objetivo (N·m/°)", 1000.0, 6000.0, 3000.0, 100.0)
+        viz_mode_1 = st.radio("Colorear en 3D:", ["Von Mises (MPa)", "Desplazamiento (mm)"], key="v1")
 
     fixed_1, loads_1, meta_1 = build_test_case("torsion", nodes, regions, {
         "m_pilot": m_pilot, "m_engine": m_engine, "m_misc": m_misc, "torque_Nm": torque_Nm
@@ -826,27 +826,27 @@ with tabs[0]:
     disp_max_1 = float(np.max(res_1["disp_node"]))
 
     with col_ctrl:
-        if K_torsion >= target_K:
-            st.markdown(f'<div class="status-pass">✅ PRUEBA SUPERADA: Rigidez Torsional ({K_torsion:.1f} N·m/°) ≥ Objetivo ({target_K:.0f} N·m/°)</div>', unsafe_allow_html=True)
-        else:
-            st.markdown(f'<div class="status-fail">❌ RIGIDEZ INSUFICIENTE: {K_torsion:.1f} N·m/° (Objetivo: {target_K:.0f} N·m/°). Reforzar Side Pods o Cruz Inferior.</div>', unsafe_allow_html=True)
-
+        ok_1 = K_torsion >= target_K
+        msg_1 = f"Rigidez Torsional: {K_torsion:.1f} N·m/° (Meta: {target_K:.0f} N·m/°)"
+        mostrar_estado(ok_1, msg_1)
         st.metric("Rigidez Torsional (K)", f"{K_torsion:.1f} N·m/°", f"{K_torsion - target_K:+.1f} N·m/°")
         st.metric("Ángulo de Giro (θ)", f"{theta_deg:.3f} °")
         st.metric("Von Mises Máximo", f"{vm_max_1:.1f} MPa")
         st.metric("Desplazamiento Máx.", f"{disp_max_1:.2f} mm")
-        st.metric("Masa Chasis / Long. Tubos", f"{res_1['mass_kg']:.2f} kg ({res_1['total_length_mm']/1000:.1f} m)")
+        st.metric("Masa Chasis", f"{res_1['mass_kg']:.2f} kg ({res_1['total_length_mm']/1000:.1f} m)")
 
     with col_viz:
-        st.plotly_chart(plot_chassis_3d(nodes, elements, res_1, viz_mode_1, scale_def, sy_limit), use_container_width=True)
+        fig_1 = plot_chassis_3d(nodes, elements, res_1, viz_mode_1, scale_def, sy_limit)
+        st.plotly_chart(fig_1, use_container_width=True)
 
+# PESTAÑA 2: FRENADA
 with tabs[1]:
     col_ctrl, col_viz = st.columns([1, 2.6])
     with col_ctrl:
         st.subheader("Parámetros de Frenada")
         a_brake_g = st.slider("Desaceleración de Frenada (g)", 0.8, 2.5, 1.2, 0.1)
-        st.caption("Incluye carga de 2000 N en soporte de pedal (Regla FSAE T.3.2.2).")
-        viz_mode_2 = st.radio("Variable a colorear en 3D:", ["Von Mises (MPa)", "Desplazamiento (mm)"], key="v2")
+        st.caption("Incluye 2000 N en soporte de pedal (Regla T.3.2.2).")
+        viz_mode_2 = st.radio("Colorear en 3D:", ["Von Mises (MPa)", "Desplazamiento (mm)"], key="v2")
 
     fixed_2, loads_2, _ = build_test_case("braking", nodes, regions, {
         "m_pilot": m_pilot, "m_engine": m_engine, "m_misc": m_misc, "a_brake_g": a_brake_g
@@ -857,25 +857,24 @@ with tabs[1]:
     fs_2 = sy_limit / max(vm_max_2, 1e-3)
 
     with col_ctrl:
-        if vm_max_2 <= sy_limit and disp_max_2 <= 2.0:
-            st.markdown(f'<div class="status-pass">✅ PRUEBA SUPERADA: Factor de Seguridad = {fs_2:.2f} | Deformación en mm controlada</div>', unsafe_allow_html=True)
-        else:
-            st.markdown(f'<div class="status-fail">❌ ALERTA ESTRUCTURAL: Von Mises ({vm_max_2:.1f} MPa) o Desplazamiento ({disp_max_2:.2f} mm) exceden límites.</div>', unsafe_allow_html=True)
-
+        ok_2 = (vm_max_2 <= sy_limit) and (disp_max_2 <= 2.0)
+        msg_2 = f"Factor de Seguridad = {fs_2:.2f} | Deformación máx: {disp_max_2:.2f} mm"
+        mostrar_estado(ok_2, msg_2)
         st.metric("Von Mises Máximo", f"{vm_max_2:.2f} MPa", f"Límite: {sy_limit:.0f} MPa")
         st.metric("Desplazamiento Máx.", f"{disp_max_2:.3f} mm", "Ref: < 2.0 mm")
         st.metric("Factor de Seguridad (FS)", f"{fs_2:.2f}")
 
     with col_viz:
-        st.plotly_chart(plot_chassis_3d(nodes, elements, res_2, viz_mode_2, scale_def, sy_limit), use_container_width=True)
+        fig_2 = plot_chassis_3d(nodes, elements, res_2, viz_mode_2, scale_def, sy_limit)
+        st.plotly_chart(fig_2, use_container_width=True)
 
+# PESTAÑA 3: ACELERACIÓN
 with tabs[2]:
     col_ctrl, col_viz = st.columns([1, 2.6])
     with col_ctrl:
         st.subheader("Parámetros de Aceleración")
         a_accel_g = st.slider("Aceleración Longitudinal (g)", 0.4, 2.0, 0.7, 0.1)
-        st.caption("Eje trasero fijo en X,Y,Z; eje delantero libre longitudinalmente.")
-        viz_mode_3 = st.radio("Variable a colorear en 3D:", ["Von Mises (MPa)", "Desplazamiento (mm)"], key="v3")
+        viz_mode_3 = st.radio("Colorear en 3D:", ["Von Mises (MPa)", "Desplazamiento (mm)"], key="v3")
 
     fixed_3, loads_3, _ = build_test_case("acceleration", nodes, regions, {
         "m_pilot": m_pilot, "m_engine": m_engine, "m_misc": m_misc, "a_accel_g": a_accel_g
@@ -886,29 +885,29 @@ with tabs[2]:
     fs_3 = sy_limit / max(vm_max_3, 1e-3)
 
     with col_ctrl:
-        if vm_max_3 <= sy_limit and disp_max_3 <= 2.0:
-            st.markdown(f'<div class="status-pass">✅ PRUEBA SUPERADA: Factor de Seguridad = {fs_3:.2f}</div>', unsafe_allow_html=True)
-        else:
-            st.markdown(f'<div class="status-fail">❌ ALERTA ESTRUCTURAL: Revisar anclajes de motor y subchasis trasero.</div>', unsafe_allow_html=True)
-
+        ok_3 = (vm_max_3 <= sy_limit) and (disp_max_3 <= 2.0)
+        msg_3 = f"Factor de Seguridad = {fs_3:.2f} | Tensión: {vm_max_3:.1f} MPa"
+        mostrar_estado(ok_3, msg_3)
         st.metric("Von Mises Máximo", f"{vm_max_3:.2f} MPa", f"Límite: {sy_limit:.0f} MPa")
         st.metric("Desplazamiento Máx.", f"{disp_max_3:.3f} mm")
         st.metric("Factor de Seguridad (FS)", f"{fs_3:.2f}")
 
     with col_viz:
-        st.plotly_chart(plot_chassis_3d(nodes, elements, res_3, viz_mode_3, scale_def, sy_limit), use_container_width=True)
+        fig_3 = plot_chassis_3d(nodes, elements, res_3, viz_mode_3, scale_def, sy_limit)
+        st.plotly_chart(fig_3, use_container_width=True)
 
+# PESTAÑA 4: CURVA Y TILT TEST
 with tabs[3]:
     col_ctrl, col_viz = st.columns([1, 2.6])
     with col_ctrl:
         st.subheader("Curva / Tilt Test (IN.11.2.2)")
         lat_mode = st.selectbox(
             "Escenario Lateral",
-            ["Tilt Test Oficial 60° (1.7 g - Regla IN.11.2.2)", "Paso por Curva Skidpad / Autocross (1.3 g)"]
+            ["Tilt Test 60° (1.7 g - Regla IN.11.2.2)", "Curva en Pista (1.3 g)"]
         )
         default_lat = 1.7 if "1.7" in lat_mode else 1.3
         a_lat_g = st.slider("Aceleración Lateral (g)", 0.9, 2.5, default_lat, 0.1)
-        viz_mode_4 = st.radio("Variable a colorear en 3D:", ["Von Mises (MPa)", "Desplazamiento (mm)"], key="v4")
+        viz_mode_4 = st.radio("Colorear en 3D:", ["Von Mises (MPa)", "Desplazamiento (mm)"], key="v4")
 
     fixed_4, loads_4, _ = build_test_case("cornering", nodes, regions, {
         "m_pilot": m_pilot, "m_engine": m_engine, "m_misc": m_misc, "a_lat_g": a_lat_g
@@ -919,24 +918,24 @@ with tabs[3]:
     fs_4 = sy_limit / max(vm_max_4, 1e-3)
 
     with col_ctrl:
-        if vm_max_4 <= sy_limit and disp_max_4 <= 2.5:
-            st.markdown(f'<div class="status-pass">✅ PRUEBA SUPERADA: Soporta {a_lat_g:.1f} g laterales (FS = {fs_4:.2f})</div>', unsafe_allow_html=True)
-        else:
-            st.markdown(f'<div class="status-fail">❌ ALERTA ESTRUCTURAL: Tensión máxima {vm_max_4:.1f} MPa.</div>', unsafe_allow_html=True)
-
+        ok_4 = (vm_max_4 <= sy_limit) and (disp_max_4 <= 2.5)
+        msg_4 = f"Soporta {a_lat_g:.1f} g laterales (FS = {fs_4:.2f})"
+        mostrar_estado(ok_4, msg_4)
         st.metric("Von Mises Máximo", f"{vm_max_4:.2f} MPa", f"Límite: {sy_limit:.0f} MPa")
         st.metric("Desplazamiento Lateral Máx.", f"{disp_max_4:.3f} mm")
         st.metric("Factor de Seguridad (FS)", f"{fs_4:.2f}")
 
     with col_viz:
-        st.plotly_chart(plot_chassis_3d(nodes, elements, res_4, viz_mode_4, scale_def, sy_limit), use_container_width=True)
+        fig_4 = plot_chassis_3d(nodes, elements, res_4, viz_mode_4, scale_def, sy_limit)
+        st.plotly_chart(fig_4, use_container_width=True)
 
+# PESTAÑA 5: REMOLQUE
 with tabs[4]:
     col_ctrl, col_viz = st.columns([1, 2.6])
     with col_ctrl:
         st.subheader("Prueba de Remolque (VE.2.1)")
-        st.caption("Sujeción en el Jacking Point trasero soportando la totalidad de las masas del monoplaza en voladizo.")
-        viz_mode_5 = st.radio("Variable a colorear en 3D:", ["Von Mises (MPa)", "Desplazamiento (mm)"], key="v5")
+        st.caption("Sujeción en el Jacking Point trasero soportando el peso del vehículo.")
+        viz_mode_5 = st.radio("Colorear en 3D:", ["Von Mises (MPa)", "Desplazamiento (mm)"], key="v5")
 
     fixed_5, loads_5, _ = build_test_case("towing", nodes, regions, {
         "m_pilot": m_pilot, "m_engine": m_engine, "m_misc": m_misc
@@ -947,18 +946,18 @@ with tabs[4]:
     fs_5 = sy_limit / max(vm_max_5, 1e-3)
 
     with col_ctrl:
-        if vm_max_5 <= sy_limit:
-            st.markdown(f'<div class="status-pass">✅ PRUEBA SUPERADA: El Jacking Point soporta el izado (FS = {fs_5:.2f})</div>', unsafe_allow_html=True)
-        else:
-            st.markdown(f'<div class="status-fail">❌ FALLO EN PUNTO DE IZADO: Supera el límite elástico ({vm_max_5:.1f} MPa).</div>', unsafe_allow_html=True)
-
+        ok_5 = vm_max_5 <= sy_limit
+        msg_5 = f"Jacking Point verificado (FS = {fs_5:.2f} | {vm_max_5:.1f} MPa)"
+        mostrar_estado(ok_5, msg_5)
         st.metric("Von Mises Máximo", f"{vm_max_5:.2f} MPa", f"Límite: {sy_limit:.0f} MPa")
         st.metric("Desplazamiento en Punta", f"{disp_max_5:.2f} mm")
         st.metric("Factor de Seguridad (FS)", f"{fs_5:.2f}")
 
     with col_viz:
-        st.plotly_chart(plot_chassis_3d(nodes, elements, res_5, viz_mode_5, scale_def, sy_limit), use_container_width=True)
+        fig_5 = plot_chassis_3d(nodes, elements, res_5, viz_mode_5, scale_def, sy_limit)
+        st.plotly_chart(fig_5, use_container_width=True)
 
+# PESTAÑA 6: IMPACTO FRONTAL Y ARNÉS
 with tabs[5]:
     col_ctrl, col_viz = st.columns([1, 2.6])
     with col_ctrl:
@@ -966,14 +965,14 @@ with tabs[5]:
         ia_type = st.selectbox(
             "Nivel de Carga Frontal (Reglas F.8.3 / F.8.7)",
             [
-                "Placa Anti-Intrusión Estática (120 kN - Regla F.8.3.1)",
-                "Atenuador Espuma Estándar (95 kN - Regla F.8.7.2)",
-                "Atenuador Honeycomb Estándar (60 kN - Regla F.8.7.2)"
+                "Placa Anti-Intrusión (120 kN - Regla F.8.3.1)",
+                "Atenuador Espuma (95 kN - Regla F.8.7.2)",
+                "Atenuador Honeycomb (60 kN - Regla F.8.7.2)"
             ]
         )
         f_imp = 120.0 if "120" in ia_type else (95.0 if "95" in ia_type else 60.0)
-        st.caption("Incluye simultáneamente 30 kN en los anclajes del arnés (F.7.9.1) y 900 N en el reposacabezas (T.2.8.5).")
-        viz_mode_6 = st.radio("Variable a colorear en 3D:", ["Von Mises (MPa)", "Desplazamiento (mm)"], key="v6")
+        st.caption("Incluye 30 kN en arnés (F.7.9.1) y 900 N en reposacabezas (T.2.8.5).")
+        viz_mode_6 = st.radio("Colorear en 3D:", ["Von Mises (MPa)", "Desplazamiento (mm)"], key="v6")
 
     fixed_6, loads_6, _ = build_test_case("impact_fsae", nodes, regions, {
         "m_pilot": m_pilot, "m_engine": m_engine, "m_misc": m_misc, "f_impact_kN": f_imp
@@ -985,7 +984,13 @@ with tabs[5]:
     fs_6 = su_limit / max(vm_max_6, 1e-3)
 
     with col_ctrl:
-        if vm_max_6 <= su_limit and disp_max_6 <= 25.0:
-            st.markdown(f'<div class="status-pass">✅ CUMPLE FSAE F.8: Sin colapso ni intrusión > 25 mm (FS Último = {fs_6:.2f})</div>', unsafe_allow_html=True)
-        else:
-            st.markdown(f'<div class="status-fail">❌ SOBREESFUERZO EN IMPACTO: {vm_max_6:.1f} MPa (Límite Último Su: {su_limit:.0
+        ok_6 = (vm_max_6 <= su_limit) and (disp_max_6 <= 25.0)
+        msg_6 = f"Impacto F.8: {vm_max_6:.1f} MPa (Límite Su: {su_limit:.0f} MPa | FS: {fs_6:.2f})"
+        mostrar_estado(ok_6, msg_6)
+        st.metric("Von Mises Pico Impacto", f"{vm_max_6:.1f} MPa", f"Su máx: {su_limit:.0f} MPa")
+        st.metric("Deflexión Front Bulkhead", f"{disp_max_6:.2f} mm", "Máx F.8.8.6: 25.0 mm")
+        st.metric("Área / Inercia Tubo", f"{area_sec:.0f} mm² | {inertia_sec:.0f} mm⁴")
+
+    with col_viz:
+        fig_6 = plot_chassis_3d(nodes, elements, res_6, viz_mode_6, max(scale_def // 4, 1), su_limit)
+        st.plotly_chart(fig_6, use_container_width=True)
