@@ -96,20 +96,19 @@ def mostrar_estado(aprobado, texto):
 
 
 # =====================================================================
-# 2. LECTOR Y REPARADOR TOPOLÓGICO DE CHASIS CAD (.IGS / .DXF)
+# 2. LECTOR Y AUTO-ORIENTADOR DE CHASIS CAD (.IGS / .DXF)
 # =====================================================================
-def clean_and_weld_chassis_mesh(raw_lines, scale_factor=1.0, swap_yz=False, tol_mm=5.0):
-    """
-    1. Escala los segmentos a milímetros.
-    2. Fusiona nodos cercanos dentro de tol_mm.
-    3. Parte automáticamente barras continuas donde apoya otro nodo (uniones en T).
-    4. Filtra líneas constructivas sueltas conservando el componente conexo principal.
-    5. Orienta automáticamente X = Largo, Y = Ancho, Z = Alto.
-    """
+def clean_and_weld_chassis_mesh(
+    raw_lines,
+    scale_factor=1.0,
+    rot_roll_90=False,
+    flip_front_rear=False,
+    invert_z=False,
+    tol_mm=5.0
+):
     if not raw_lines:
         return np.zeros((0, 3)), []
 
-    # Paso 1: Filtrar segmentos degenerados o gigantes (ejes infinitos de referencia)
     scaled_lines = []
     lengths = []
     for p1, p2 in raw_lines:
@@ -123,13 +122,11 @@ def clean_and_weld_chassis_mesh(raw_lines, scale_factor=1.0, swap_yz=False, tol_
     if not scaled_lines:
         return np.zeros((0, 3)), []
 
-    # Filtrar líneas de construcción atípicas (> 4 veces la mediana de los tubos)
     med_L = float(np.median(lengths))
     valid_lines = [seg for seg, L in zip(scaled_lines, lengths) if L <= max(med_L * 6.0, 3500.0)]
     if len(valid_lines) < 4:
         valid_lines = scaled_lines
 
-    # Paso 2: Fusionar nodos extremos cercanos
     nodes = []
 
     def get_or_add_node(pt):
@@ -150,7 +147,7 @@ def clean_and_weld_chassis_mesh(raw_lines, scale_factor=1.0, swap_yz=False, tol_
 
     nodes_arr = np.array(nodes, dtype=float)
 
-    # Paso 3: Partir tubos en uniones tipo "T" (cuando un nodo cae en medio de otro tubo)
+    # Partir tubos en uniones tipo "T"
     split_edges = []
     for u, v in initial_edges:
         pA = nodes_arr[u]
@@ -182,13 +179,12 @@ def clean_and_weld_chassis_mesh(raw_lines, scale_factor=1.0, swap_yz=False, tol_
                 if n1 != n2:
                     split_edges.append((min(n1, n2), max(n1, n2)))
 
-    # Eliminar duplicados
     unique_edges = []
     for e in split_edges:
         if e not in unique_edges:
             unique_edges.append(e)
 
-    # Paso 4: Conservar solo la estructura principal conectada (elimina líneas flotantes)
+    # Conservar el componente conexo principal
     if len(nodes_arr) > 0 and len(unique_edges) > 0:
         adj = {i: [] for i in range(len(nodes_arr))}
         for u, v in unique_edges:
@@ -228,18 +224,58 @@ def clean_and_weld_chassis_mesh(raw_lines, scale_factor=1.0, swap_yz=False, tol_
             nodes_arr = np.array(new_nodes, dtype=float)
             unique_edges = new_edges
 
-    # Paso 5: Ordenar los ejes para que X sea Largo, Y sea Ancho y Z sea Alto
+    # Auto-orientación inteligente del chasis FSAE:
+    # 1. El eje con mayor extensión es X (Largo longitudinal ~2430 mm)
+    # 2. Entre los otros dos ejes, el eje Lateral (Y) es simétrico respecto a la media,
+    #    mientras que el eje Vertical (Z) tiene los puntos del Main Hoop alejados de la base.
     if len(nodes_arr) >= 4:
-        if swap_yz:
-            nodes_arr = nodes_arr[:, [0, 2, 1]]
-        else:
-            spans = np.ptp(nodes_arr, axis=0)
-            # Ordenar de mayor a menor span: el mayor siempre es X (Largo del auto)
-            order = np.argsort(spans)[::-1]
-            # El eje más largo es X (order[0]); entre los otros dos, si Y es vertical en SW, lo pasamos a Z
-            nodes_arr = nodes_arr[:, [order[0], order[1], order[2]]]
+        spans = np.ptp(nodes_arr, axis=0)
+        idx_long = int(np.argmax(spans))
+        rem = [i for i in range(3) if i != idx_long]
 
-        # Normalizar origen: X desde 0, Y centrado en 0, Z desde 0
+        # Evaluar asimetría vertical (el Main Hoop tiene pocos nodos muy altos, por lo que
+        # la distancia del promedio al extremo superior es distinta que al piso)
+         c0 = nodes_arr[:, rem[0]]
+        c1 = nodes_arr[:, rem[1]]
+        # En un chasis tubular sin pontones, Alto Z (~1100-1350 mm) > Ancho Y (~600-800 mm)
+        if spans[rem[0]] >= spans[rem[1]]:
+            idx_vert = rem[0]
+            idx_lat = rem[1]
+        else:
+            idx_vert = rem[1]
+            idx_lat = rem[0]
+
+        nodes_arr = nodes_arr[:, [idx_long, idx_lat, idx_vert]]
+
+        # Si el usuario pide rotar 90° sobre el eje longitudinal X (intercambiar Ancho Y <-> Alto Z)
+        if rot_roll_90:
+            nodes_arr = nodes_arr[:, [0, 2, 1]]
+
+        # Asegurar que el Main Hoop (parte superior) apunte hacia +Z (arriba)
+        # El piso del chasis tiene muchos más nodos que la punta del arco principal:
+        z_vals = nodes_arr[:, 2]
+        z_mid = 0.5 * (z_vals.min() + z_vals.max())
+        n_below = np.sum(z_vals < z_mid)
+        n_above = np.sum(z_vals >= z_mid)
+        if n_above > n_below:
+            nodes_arr[:, 2] = -nodes_arr[:, 2]
+
+        if invert_z:
+            nodes_arr[:, 2] = -nodes_arr[:, 2]
+
+        # Asegurar que el Frente del auto quede en X = 0 y el Main Hoop en la mitad trasera (X > L/2)
+        nodes_arr[:, 2] -= nodes_arr[:, 2].min()
+        top_z_nodes = np.argsort(nodes_arr[:, 2])[-3:]
+        x_of_top = np.mean(nodes_arr[top_z_nodes, 0])
+        x_mid = 0.5 * (nodes_arr[:, 0].min() + nodes_arr[:, 0].max())
+        if x_of_top < x_mid:
+            nodes_arr[:, 0] = -nodes_arr[:, 0]
+
+        if flip_front_rear:
+            nodes_arr[:, 0] = -nodes_arr[:, 0]
+
+        # Normalizar coordenadas finales en milímetros:
+        # X desde 0 (Front Bulkhead) hacia atrás (+X), Y centrado en 0, Z desde 0 (piso) hacia arriba (+Z)
         nodes_arr[:, 0] -= nodes_arr[:, 0].min()
         nodes_arr[:, 1] -= 0.5 * (nodes_arr[:, 1].max() + nodes_arr[:, 1].min())
         nodes_arr[:, 2] -= nodes_arr[:, 2].min()
@@ -247,7 +283,7 @@ def clean_and_weld_chassis_mesh(raw_lines, scale_factor=1.0, swap_yz=False, tol_
     return nodes_arr, unique_edges
 
 
-def parse_dxf(content_str, scale_factor=1.0, swap_yz=False, tol_mm=5.0):
+def parse_dxf(content_str, scale_factor=1.0, rot_roll_90=False, flip_front_rear=False, invert_z=False, tol_mm=5.0):
     lines_list = [line.strip() for line in content_str.splitlines()]
     raw_segments = []
     i = 0
@@ -276,10 +312,10 @@ def parse_dxf(content_str, scale_factor=1.0, swap_yz=False, tol_mm=5.0):
         else:
             i += 2
 
-    return clean_and_weld_chassis_mesh(raw_segments, scale_factor, swap_yz, tol_mm)
+    return clean_and_weld_chassis_mesh(raw_segments, scale_factor, rot_roll_90, flip_front_rear, invert_z, tol_mm)
 
 
-def parse_iges(content_str, scale_factor=1.0, swap_yz=False, tol_mm=5.0):
+def parse_iges(content_str, scale_factor=1.0, rot_roll_90=False, flip_front_rear=False, invert_z=False, tol_mm=5.0):
     p_lines = []
     for line in content_str.splitlines():
         if len(line) >= 73 and line[72] == "P":
@@ -330,7 +366,7 @@ def parse_iges(content_str, scale_factor=1.0, swap_yz=False, tol_mm=5.0):
         except (ValueError, IndexError):
             continue
 
-    return clean_and_weld_chassis_mesh(raw_segments, scale_factor, swap_yz, tol_mm)
+    return clean_and_weld_chassis_mesh(raw_segments, scale_factor, rot_roll_90, flip_front_rear, invert_z, tol_mm)
 
 
 def generate_reference_fsae_chassis():
@@ -470,9 +506,8 @@ def solve_frame_3d(nodes, elements, prop_dict, fixed_dofs, nodal_loads):
         for j in range(min(len(force_vec), 6)):
             F_global[6 * node_id + j] += force_vec[j]
 
-    # Estabilización elástica suave para nodos con baja conectividad en croquis CAD
-    diag_mean = max(float(np.mean(np.diag(K_global))), 100.0)
-    K_global += np.eye(ndof) * (diag_mean * 1e-4)
+    # Regularización mínima sin alterar la rigidez física real del chasis
+    K_global += np.eye(ndof) * 1e-3
 
     free_dofs = np.setdiff1d(np.arange(ndof), np.unique(fixed_dofs))
     U = np.zeros(ndof)
@@ -532,37 +567,37 @@ def identify_key_regions(nodes):
     z_min, z_max = z.min(), z.max()
     H_total = max(z_max - z_min, 1.0)
 
-    front_bulkhead = np.where(x <= x_min + 0.10 * L_total)[0]
-    if len(front_bulkhead) < 4:
-        front_bulkhead = np.argsort(x)[:6]
+    front_bulkhead = np.where(x <= x_min + 0.08 * L_total)[0]
+    if len(front_bulkhead) < 2:
+        front_bulkhead = np.argsort(x)[:4]
 
-    cond_fs = (x >= x_min + 0.14 * L_total) & (x <= x_min + 0.38 * L_total) & (z <= z_min + 0.55 * H_total)
+    cond_fs = (x >= x_min + 0.14 * L_total) & (x <= x_min + 0.36 * L_total) & (z <= z_min + 0.45 * H_total)
     front_susp = np.where(cond_fs)[0]
-    if len(front_susp) < 4:
-        front_susp = np.argsort(np.abs(x - (x_min + 0.25 * L_total)))[:6]
+    if len(front_susp) < 2:
+        front_susp = np.argsort(np.abs(x - (x_min + 0.24 * L_total)))[:4]
 
-    cond_ck = (x >= x_min + 0.38 * L_total) & (x <= x_min + 0.72 * L_total) & (z <= z_min + 0.60 * H_total)
+    cond_ck = (x >= x_min + 0.38 * L_total) & (x <= x_min + 0.72 * L_total) & (z <= z_min + 0.55 * H_total)
     cockpit_nodes = np.where(cond_ck)[0]
-    if len(cockpit_nodes) < 4:
-        cockpit_nodes = np.argsort(np.abs(x - (x_min + 0.55 * L_total)))[:8]
+    if len(cockpit_nodes) < 2:
+        cockpit_nodes = np.argsort(np.abs(x - (x_min + 0.55 * L_total)))[:6]
 
     main_hoop_top = np.where(z >= z_min + 0.75 * H_total)[0]
-    if len(main_hoop_top) < 2:
-        main_hoop_top = np.argsort(z)[-4:]
+    if len(main_hoop_top) < 1:
+        main_hoop_top = np.argsort(z)[-2:]
 
-    cond_en = (x >= x_min + 0.68 * L_total) & (x <= x_min + 0.92 * L_total) & (z <= z_min + 0.60 * H_total)
+    cond_en = (x >= x_min + 0.68 * L_total) & (x <= x_min + 0.92 * L_total) & (z <= z_min + 0.55 * H_total)
     engine_nodes = np.where(cond_en)[0]
-    if len(engine_nodes) < 4:
-        engine_nodes = np.argsort(np.abs(x - (x_min + 0.80 * L_total)))[:6]
+    if len(engine_nodes) < 2:
+        engine_nodes = np.argsort(np.abs(x - (x_min + 0.80 * L_total)))[:4]
 
-    cond_rs = (x >= x_min + 0.75 * L_total) & (x <= x_min + 0.96 * L_total) & (z <= z_min + 0.55 * H_total)
+    cond_rs = (x >= x_min + 0.78 * L_total) & (x <= x_min + 0.96 * L_total) & (z <= z_min + 0.50 * H_total)
     rear_susp = np.where(cond_rs)[0]
-    if len(rear_susp) < 4:
-        rear_susp = np.argsort(x)[-10:-2]
+    if len(rear_susp) < 2:
+        rear_susp = np.argsort(x)[-6:-2]
 
-    jacking_nodes = np.where(x >= x_min + 0.90 * L_total)[0]
-    if len(jacking_nodes) < 4:
-        jacking_nodes = np.argsort(x)[-6:]
+    jacking_nodes = np.where(x >= x_min + 0.92 * L_total)[0]
+    if len(jacking_nodes) < 2:
+        jacking_nodes = np.argsort(x)[-4:]
 
     return {
         "front_bulkhead": front_bulkhead,
@@ -597,14 +632,15 @@ def build_test_case(test_name, nodes, regions, params):
         for nid in regions["rear_susp"]:
             fixed_dofs.extend([6*nid + j for j in range(6)])
         y_coords = nodes[regions["front_susp"], 1]
-        left_nodes = regions["front_susp"][y_coords > 0]
-        right_nodes = regions["front_susp"][y_coords < 0]
+        left_nodes = regions["front_susp"][y_coords > 10.0]
+        right_nodes = regions["front_susp"][y_coords < -10.0]
         if len(left_nodes) == 0 or len(right_nodes) == 0:
-            half = len(regions["front_susp"]) // 2
-            left_nodes = regions["front_susp"][:max(half, 1)]
-            right_nodes = regions["front_susp"][max(half, 1):]
+            order_y = np.argsort(y_coords)
+            half = max(len(order_y) // 2, 1)
+            right_nodes = regions["front_susp"][order_y[:half]]
+            left_nodes = regions["front_susp"][order_y[-half:]]
 
-        lever_arm_mm = max(abs(np.mean(nodes[left_nodes, 1]) - np.mean(nodes[right_nodes, 1])), 450.0)
+        lever_arm_mm = max(abs(np.mean(nodes[left_nodes, 1]) - np.mean(nodes[right_nodes, 1])), 400.0)
         torque_Nmm = params["torque_Nm"] * 1000.0
         F_vert_N = torque_Nmm / lever_arm_mm
 
@@ -670,7 +706,6 @@ def plot_chassis_3d(nodes, elements, res, mode="Von Mises (MPa)", scale_def=15.0
     max_raw_disp = float(np.max(res["disp_node"]))
     chassis_span = float(np.max(np.ptp(nodes, axis=0)))
 
-    # Limitar la deformación visual máxima al 12% del tamaño del chasis para que jamás distorsione la vista 3D
     if max_raw_disp * scale_def > 0.12 * chassis_span and max_raw_disp > 1e-6:
         eff_scale = (0.12 * chassis_span) / max_raw_disp
     else:
@@ -768,8 +803,7 @@ def plot_chassis_3d(nodes, elements, res, mode="Von Mises (MPa)", scale_def=15.0
         name="Punto Crítico Máximo"
     ))
 
-    # Fijar los límites de la caja 3D a las dimensiones reales del chasis con margen del 15%
-    pad = 0.15 * chassis_span
+    pad = 0.12 * chassis_span
     xr = [float(nodes[:, 0].min() - pad), float(nodes[:, 0].max() + pad)]
     yr = [float(nodes[:, 1].min() - pad), float(nodes[:, 1].max() + pad)]
     zr = [float(nodes[:, 2].min() - pad), float(nodes[:, 2].max() + pad)]
@@ -832,7 +866,10 @@ with st.sidebar:
     }
     cad_scale = scale_map[unit_option]
 
-    swap_yz = st.checkbox("Intercambiar Eje Y <-> Z Vertical (SolidWorks)", value=True)
+    st.caption("Ajuste de orientación del chasis:")
+    rot_roll_90 = st.checkbox("Rotar 90° sobre eje X (Intercambiar Ancho Y ↔ Alto Z)", value=False)
+    invert_z = st.checkbox("Invertir Arriba ↔ Abajo (Eje Z)", value=False)
+    flip_front_rear = st.checkbox("Invertir Frente ↔ Atrás (Eje X)", value=False)
     tol_mm = st.number_input("Tolerancia soldadura de nodos (mm)", min_value=0.5, max_value=30.0, value=5.0, step=0.5)
 
     st.header("🔧 2. Tubería y Material (F.3.4)")
@@ -880,9 +917,9 @@ if uploaded_file is not None:
     raw_text = uploaded_file.read().decode("utf-8", errors="ignore")
     ext = uploaded_file.name.lower().split(".")[-1]
     if ext == "dxf":
-        nodes, elements = parse_dxf(raw_text, cad_scale, swap_yz, tol_mm)
+        nodes, elements = parse_dxf(raw_text, cad_scale, rot_roll_90, flip_front_rear, invert_z, tol_mm)
     else:
-        nodes, elements = parse_iges(raw_text, cad_scale, swap_yz, tol_mm)
+        nodes, elements = parse_iges(raw_text, cad_scale, rot_roll_90, flip_front_rear, invert_z, tol_mm)
 
     if len(nodes) < 4 or len(elements) < 3:
         st.warning("⚠️ El archivo no contiene suficientes líneas 3D conectadas. Mostrando chasis de referencia.")
@@ -890,7 +927,7 @@ if uploaded_file is not None:
     else:
         spans_mm = np.ptp(nodes, axis=0)
         st.success(
-            f"✅ Archivo **{uploaded_file.name}** soldado y mallado en **MILÍMETROS**: "
+            f"✅ Archivo **{uploaded_file.name}** orientado en **MILÍMETROS**: "
             f"**{len(nodes)} nodos** y **{len(elements)} tubos** | "
             f"Largo X = **{spans_mm[0]:.1f} mm**, Ancho Y = **{spans_mm[1]:.1f} mm**, Alto Z = **{spans_mm[2]:.1f} mm**."
         )
@@ -939,14 +976,14 @@ with tabs[0]:
     })
     res_1 = solve_frame_3d(nodes, elements, prop_dict, fixed_1, loads_1)
 
-    z_left = np.median(np.abs(res_1["u_xyz"][meta_1["left_nodes"], 2]))
-    z_right = np.median(np.abs(res_1["u_xyz"][meta_1["right_nodes"], 2]))
-    z_defl_mm = max(0.5 * (z_left + z_right), 0.05)
+    z_left = np.mean(np.abs(res_1["u_xyz"][meta_1["left_nodes"], 2]))
+    z_right = np.mean(np.abs(res_1["u_xyz"][meta_1["right_nodes"], 2]))
+    z_defl_mm = max(0.5 * (z_left + z_right), 1e-3)
     half_span_mm = meta_1["lever_arm_mm"] / 2.0
     theta_deg = max(math.degrees(math.atan(z_defl_mm / max(half_span_mm, 1.0))), 1e-4)
     K_torsion = torque_Nm / theta_deg
-    vm_max_1 = float(np.percentile(res_1["vm_elem"], 98))
-    disp_max_1 = float(np.percentile(res_1["disp_node"], 98))
+    vm_max_1 = float(np.max(res_1["vm_elem"]))
+    disp_max_1 = float(np.max(res_1["disp_node"]))
 
     with col_ctrl:
         ok_1 = K_torsion >= target_K
@@ -975,8 +1012,8 @@ with tabs[1]:
         "m_pilot": m_pilot, "m_engine": m_engine, "m_misc": m_misc, "a_brake_g": a_brake_g
     })
     res_2 = solve_frame_3d(nodes, elements, prop_dict, fixed_2, loads_2)
-    vm_max_2 = float(np.percentile(res_2["vm_elem"], 98))
-    disp_max_2 = float(np.percentile(res_2["disp_node"], 98))
+    vm_max_2 = float(np.max(res_2["vm_elem"]))
+    disp_max_2 = float(np.max(res_2["disp_node"]))
     fs_2 = sy_limit / max(vm_max_2, 1e-3)
 
     with col_ctrl:
@@ -1003,8 +1040,8 @@ with tabs[2]:
         "m_pilot": m_pilot, "m_engine": m_engine, "m_misc": m_misc, "a_accel_g": a_accel_g
     })
     res_3 = solve_frame_3d(nodes, elements, prop_dict, fixed_3, loads_3)
-    vm_max_3 = float(np.percentile(res_3["vm_elem"], 98))
-    disp_max_3 = float(np.percentile(res_3["disp_node"], 98))
+    vm_max_3 = float(np.max(res_3["vm_elem"]))
+    disp_max_3 = float(np.max(res_3["disp_node"]))
     fs_3 = sy_limit / max(vm_max_3, 1e-3)
 
     with col_ctrl:
@@ -1036,8 +1073,8 @@ with tabs[3]:
         "m_pilot": m_pilot, "m_engine": m_engine, "m_misc": m_misc, "a_lat_g": a_lat_g
     })
     res_4 = solve_frame_3d(nodes, elements, prop_dict, fixed_4, loads_4)
-    vm_max_4 = float(np.percentile(res_4["vm_elem"], 98))
-    disp_max_4 = float(np.percentile(res_4["disp_node"], 98))
+    vm_max_4 = float(np.max(res_4["vm_elem"]))
+    disp_max_4 = float(np.max(res_4["disp_node"]))
     fs_4 = sy_limit / max(vm_max_4, 1e-3)
 
     with col_ctrl:
@@ -1064,8 +1101,8 @@ with tabs[4]:
         "m_pilot": m_pilot, "m_engine": m_engine, "m_misc": m_misc
     })
     res_5 = solve_frame_3d(nodes, elements, prop_dict, fixed_5, loads_5)
-    vm_max_5 = float(np.percentile(res_5["vm_elem"], 98))
-    disp_max_5 = float(np.percentile(res_5["disp_node"], 98))
+    vm_max_5 = float(np.max(res_5["vm_elem"]))
+    disp_max_5 = float(np.max(res_5["disp_node"]))
     fs_5 = sy_limit / max(vm_max_5, 1e-3)
 
     with col_ctrl:
@@ -1101,8 +1138,8 @@ with tabs[5]:
         "m_pilot": m_pilot, "m_engine": m_engine, "m_misc": m_misc, "f_impact_kN": f_imp
     })
     res_6 = solve_frame_3d(nodes, elements, prop_dict, fixed_6, loads_6)
-    vm_max_6 = float(np.percentile(res_6["vm_elem"], 98))
-    disp_max_6 = float(np.percentile(res_6["disp_node"], 98))
+    vm_max_6 = float(np.max(res_6["vm_elem"]))
+    disp_max_6 = float(np.max(res_6["disp_node"]))
     su_limit = 365.0
     fs_6 = su_limit / max(vm_max_6, 1e-3)
 
