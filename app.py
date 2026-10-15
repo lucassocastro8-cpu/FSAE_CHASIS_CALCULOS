@@ -88,23 +88,34 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # =====================================================================
-# 2. LECTOR DE ARCHIVOS CAD (.DXF y .IGS / .IGES) + CHASIS DEMO
+# 2. LECTOR DE ARCHIVOS CAD EN MILÍMETROS (.DXF y .IGS / .IGES)
 # =====================================================================
-def merge_nodes_and_elements(raw_lines, tol=2.0):
+def merge_nodes_and_elements(raw_lines, scale_factor=1.0, swap_yz=False, tol_mm=1.5):
+    """
+    Convierte los segmentos crudos del CAD aplicando primero el factor de escala
+    para que todas las coordenadas queden estrictamente en MILÍMETROS (mm)
+    antes de fusionar nodos cercanos con tolerancia tol_mm.
+    """
     nodes = []
     elements = []
 
     def get_or_add_node(pt):
         for idx, n in enumerate(nodes):
-            if np.linalg.norm(pt - n) <= tol:
+            if np.linalg.norm(pt - n) <= tol_mm:
                 return idx
         nodes.append(pt)
         return len(nodes) - 1
 
     for p1, p2 in raw_lines:
-        p1_arr = np.array(p1, dtype=float)
-        p2_arr = np.array(p2, dtype=float)
-        if np.linalg.norm(p2_arr - p1_arr) < tol:
+        p1_arr = np.array(p1, dtype=float) * scale_factor
+        p2_arr = np.array(p2, dtype=float) * scale_factor
+
+        if swap_yz:
+            # Si viene de SolidWorks (Y arriba), pasamos Y -> Z vertical
+            p1_arr = np.array([p1_arr[0], p1_arr[2], p1_arr[1]])
+            p2_arr = np.array([p2_arr[0], p2_arr[2], p2_arr[1]])
+
+        if np.linalg.norm(p2_arr - p1_arr) < tol_mm:
             continue
         i = get_or_add_node(p1_arr)
         j = get_or_add_node(p2_arr)
@@ -114,14 +125,26 @@ def merge_nodes_and_elements(raw_lines, tol=2.0):
                 elements.append(edge)
 
     nodes_arr = np.array(nodes, dtype=float)
-    if len(nodes_arr) > 0:
-        span = np.ptp(nodes_arr, axis=0).max()
-        if span < 15.0:
-            nodes_arr *= 1000.0
+
+    # Asegurar que el eje más largo del chasis quede alineado como X longitudinal
+    if len(nodes_arr) >= 4:
+        spans = np.ptp(nodes_arr, axis=0)
+        if spans[1] > spans[0] and spans[1] > spans[2]:
+            # Si el chasis está orientado a lo largo del eje Y, rotamos X <-> Y
+            nodes_arr = nodes_arr[:, [1, 0, 2]]
+        elif spans[2] > spans[0] and spans[2] > spans[1]:
+            # Si el chasis está orientado a lo largo del eje Z, rotamos X <-> Z
+            nodes_arr = nodes_arr[:, [2, 1, 0]]
+
+        # Centrar Y (lateral) en 0 y poner Z mínimo (piso del chasis) en 0 mm
+        nodes_arr[:, 0] -= nodes_arr[:, 0].min()
+        nodes_arr[:, 1] -= 0.5 * (nodes_arr[:, 1].max() + nodes_arr[:, 1].min())
+        nodes_arr[:, 2] -= nodes_arr[:, 2].min()
 
     return nodes_arr, elements
 
-def parse_dxf(content_str):
+
+def parse_dxf(content_str, scale_factor=1.0, swap_yz=False, tol_mm=1.5):
     lines_list = [line.strip() for line in content_str.splitlines()]
     raw_segments = []
     i = 0
@@ -150,17 +173,22 @@ def parse_dxf(content_str):
         else:
             i += 2
 
-    return merge_nodes_and_elements(raw_segments)
+    return merge_nodes_and_elements(raw_segments, scale_factor, swap_yz, tol_mm)
 
-def parse_iges(content_str):
-    p_lines = {}
+
+def parse_iges(content_str, scale_factor=1.0, swap_yz=False, tol_mm=1.5):
+    """
+    Lee entidades de curva 3D en archivos .IGS / .IGES:
+    - Tipo 110: Line Entity
+    - Tipo 126: Rational B-Spline Curve (líneas y arcos exportados como NURBS)
+    - Tipo 106: Copious Data (polilíneas 3D)
+    """
+    p_lines = []
     for line in content_str.splitlines():
         if len(line) >= 73 and line[72] == 'P':
-            p_data = line[:64].strip()
-            seq_str = line[64:72].strip()
-            p_lines[seq_str] = p_data
+            p_lines.append(line[:64].strip())
 
-    full_p_text = "".join(p_lines[k] for k in sorted(p_lines.keys(), key=lambda x: int(x) if x.isdigit() else 0))
+    full_p_text = "".join(p_lines)
     records = [r.strip() for r in full_p_text.split(";") if r.strip()]
 
     raw_segments = []
@@ -185,12 +213,26 @@ def parse_iges(content_str):
                     x1, y1, z1 = float(parts[start_cp]), float(parts[start_cp+1]), float(parts[start_cp+2])
                     x2, y2, z2 = float(parts[end_cp]), float(parts[end_cp+1]), float(parts[end_cp+2])
                     raw_segments.append(([x1, y1, z1], [x2, y2, z2]))
+            elif ent_type == 106 and len(parts) >= 9:
+                ip = int(float(parts[1]))
+                n_pts = int(float(parts[2]))
+                if ip == 2 and len(parts) >= 3 + 3 * n_pts:
+                    pts = []
+                    for k in range(n_pts):
+                        px = float(parts[3 + 3*k])
+                        py = float(parts[4 + 3*k])
+                        pz = float(parts[5 + 3*k])
+                        pts.append([px, py, pz])
+                    for k in range(len(pts) - 1):
+                        raw_segments.append((pts[k], pts[k+1]))
         except (ValueError, IndexError):
             continue
 
-    return merge_nodes_and_elements(raw_segments)
+    return merge_nodes_and_elements(raw_segments, scale_factor, swap_yz, tol_mm)
+
 
 def generate_reference_fsae_chassis():
+    """Chasis de referencia íntegramente en MILÍMETROS (mm)."""
     nodes = np.array([
         [0, -190, 20],    [0, 190, 20],     [0, 190, 360],    [0, -190, 360],
         [520, -220, 0],   [520, 220, 0],    [520, 238, 420],  [520, -238, 420],
@@ -237,11 +279,11 @@ def generate_reference_fsae_chassis():
     return nodes, unique_elems
 
 # =====================================================================
-# 3. MOTOR DE ELEMENTOS FINITOS 3D (MÉTODO DE LA RIGIDEZ DIRECTA)
+# 3. MOTOR DE ELEMENTOS FINITOS 3D EN MILÍMETROS (N, mm, MPa)
 # =====================================================================
 def beam_3d_transformation_matrix(p1, p2):
     dx, dy, dz = p2 - p1
-    L = math.sqrt(dx*dx + dy*dy + dz*dz)
+    L = max(math.sqrt(dx*dx + dy*dy + dz*dz), 1e-3)
     cx, cy, cz = dx / L, dy / L, dz / L
 
     if abs(cx) < 1e-6 and abs(cy) < 1e-6:
@@ -260,6 +302,14 @@ def beam_3d_transformation_matrix(p1, p2):
     return T, L
 
 def beam_3d_local_stiffness(E, G, A, Iy, Iz, J, L):
+    """
+    Unidades de entrada:
+    - E, G en MPa (N/mm²)
+    - A en mm²
+    - Iy, Iz, J en mm⁴
+    - L en mm
+    Unidades de salida: Fuerzas en N, Momentos en N·mm, Desplazamientos en mm.
+    """
     k = np.zeros((12, 12))
     EA_L = E * A / L
     GJ_L = G * J / L
@@ -291,26 +341,26 @@ def solve_frame_3d(nodes, elements, prop_dict, fixed_dofs, nodal_loads):
     K_global = np.zeros((ndof, ndof))
     F_global = np.zeros(ndof)
 
-    E = prop_dict["E"]
-    G = prop_dict["G"]
-    D = prop_dict["OD"]
-    t = prop_dict["t"]
-    rho = prop_dict["rho"]
+    E = prop_dict["E"]          # MPa (N/mm²)
+    G = prop_dict["G"]          # MPa (N/mm²)
+    D = prop_dict["OD"]         # mm
+    t = prop_dict["t"]          # mm
+    rho = prop_dict["rho"]      # kg/mm³
 
     d_in = max(D - 2.0 * t, 0.1)
-    A = (math.pi / 4.0) * (D**2 - d_in**2)
-    I = (math.pi / 64.0) * (D**4 - d_in**4)
-    J = 2.0 * I
-    c_outer = D / 2.0
+    A = (math.pi / 4.0) * (D**2 - d_in**2)          # mm²
+    I = (math.pi / 64.0) * (D**4 - d_in**4)         # mm⁴
+    J = 2.0 * I                                     # mm⁴
+    c_outer = D / 2.0                               # mm
 
     elem_cache = []
     total_length_mm = 0.0
 
     for idx, (n1, n2) in enumerate(elements):
         p1, p2 = nodes[n1], nodes[n2]
-        T, L = beam_3d_transformation_matrix(p1, p2)
-        total_length_mm += L
-        k_loc = beam_3d_local_stiffness(E, G, A, I, I, J, L)
+        T, L_mm = beam_3d_transformation_matrix(p1, p2)
+        total_length_mm += L_mm
+        k_loc = beam_3d_local_stiffness(E, G, A, I, I, J, L_mm)
         k_glob = T.T @ k_loc @ T
 
         dofs = [6*n1+j for j in range(6)] + [6*n2+j for j in range(6)]
@@ -318,13 +368,14 @@ def solve_frame_3d(nodes, elements, prop_dict, fixed_dofs, nodal_loads):
             for b in range(12):
                 K_global[dofs[a], dofs[b]] += k_glob[a, b]
 
-        elem_cache.append((n1, n2, T, k_loc, L, dofs))
+        elem_cache.append((n1, n2, T, k_loc, L_mm, dofs))
 
     for node_id, force_vec in nodal_loads.items():
         for j in range(min(len(force_vec), 6)):
             F_global[6 * node_id + j] += force_vec[j]
 
-    K_global += np.eye(ndof) * 1e-3
+    # Regularización numérica para evitar singularidades en nodos coplanares del CAD
+    K_global += np.eye(ndof) * 1e-2
     free_dofs = np.setdiff1d(np.arange(ndof), np.unique(fixed_dofs))
     U = np.zeros(ndof)
 
@@ -336,13 +387,14 @@ def solve_frame_3d(nodes, elements, prop_dict, fixed_dofs, nodal_loads):
     except np.linalg.LinAlgError:
         U[free_dofs] = np.linalg.lstsq(K_ff, F_f, rcond=None)[0]
 
-    u_xyz = U.reshape((n_nodes, 6))[:, :3]
-    disp_mag = np.linalg.norm(u_xyz, axis=1)
+    # Desplazamientos directamente en MILÍMETROS (mm)
+    u_xyz_mm = U.reshape((n_nodes, 6))[:, :3]
+    disp_mag_mm = np.linalg.norm(u_xyz_mm, axis=1)
 
     von_mises_elem = np.zeros(len(elements))
-    disp_elem = np.zeros(len(elements))
+    disp_elem_mm = np.zeros(len(elements))
 
-    for idx, (n1, n2, T, k_loc, L, dofs) in enumerate(elem_cache):
+    for idx, (n1, n2, T, k_loc, L_mm, dofs) in enumerate(elem_cache):
         u_e_glob = U[dofs]
         u_e_loc = T @ u_e_glob
         f_loc = k_loc @ u_e_loc
@@ -357,15 +409,16 @@ def solve_frame_3d(nodes, elements, prop_dict, fixed_dofs, nodal_loads):
 
         vm = math.sqrt(sigma_normal**2 + 3.0 * (tau_total**2))
         von_mises_elem[idx] = vm
-        disp_elem[idx] = 0.5 * (disp_mag[n1] + disp_mag[n2])
+        disp_elem_mm[idx] = 0.5 * (disp_mag_mm[n1] + disp_mag_mm[n2])
 
     chassis_mass_kg = total_length_mm * A * rho
     return {
-        "u_xyz": u_xyz,
-        "disp_node": disp_mag,
-        "disp_elem": disp_elem,
+        "u_xyz": u_xyz_mm,
+        "disp_node": disp_mag_mm,
+        "disp_elem": disp_elem_mm,
         "vm_elem": von_mises_elem,
         "mass_kg": chassis_mass_kg,
+        "total_length_mm": total_length_mm,
         "A_mm2": A,
         "I_mm4": I
     }
@@ -448,14 +501,15 @@ def build_test_case(test_name, nodes, regions, params):
             left_nodes = regions["front_susp"][:max(half, 1)]
             right_nodes = regions["front_susp"][max(half, 1):]
 
-        lever_arm_mm = max(abs(np.mean(nodes[left_nodes, 1]) - np.mean(nodes[right_nodes, 1])), 400.0)
+        # Brazo de palanca en MILÍMETROS (mm) y Par Torsor en N·mm
+        lever_arm_mm = max(abs(np.mean(nodes[left_nodes, 1]) - np.mean(nodes[right_nodes, 1])), 350.0)
         torque_Nmm = params["torque_Nm"] * 1000.0
-        F_vert = torque_Nmm / lever_arm_mm
+        F_vert_N = torque_Nmm / lever_arm_mm
 
         for nid in left_nodes:
-            nodal_loads[nid][2] += F_vert / len(left_nodes)
+            nodal_loads[nid][2] += F_vert_N / len(left_nodes)
         for nid in right_nodes:
-            nodal_loads[nid][2] -= F_vert / len(right_nodes)
+            nodal_loads[nid][2] -= F_vert_N / len(right_nodes)
 
         return fixed_dofs, nodal_loads, {"lever_arm_mm": lever_arm_mm, "left_nodes": left_nodes, "right_nodes": right_nodes}
 
@@ -501,7 +555,7 @@ def build_test_case(test_name, nodes, regions, params):
         return fixed_dofs, nodal_loads, {}
 
 # =====================================================================
-# 5. RENDERIZADOR 3D INTERACTIVO CON COLORES POR TUBO (PLOTLY)
+# 5. RENDERIZADOR 3D INTERACTIVO EN MILÍMETROS (PLOTLY)
 # =====================================================================
 def plot_chassis_3d(nodes, elements, res, mode="Von Mises (MPa)", scale_def=15.0, sy_limit=305.0):
     u_xyz = res["u_xyz"]
@@ -528,7 +582,7 @@ def plot_chassis_3d(nodes, elements, res, mode="Von Mises (MPa)", scale_def=15.0
         x=orig_x, y=orig_y, z=orig_z,
         mode="lines",
         line=dict(color="rgba(255, 255, 255, 0.22)", width=2, dash="dot"),
-        name="Geometría Original (Sin Deformar)",
+        name="Geometría Original (mm)",
         hoverinfo="skip"
     ))
 
@@ -545,10 +599,12 @@ def plot_chassis_3d(nodes, elements, res, mode="Von Mises (MPa)", scale_def=15.0
         val = values[idx]
         vm_val = res["vm_elem"][idx]
         d_val = res["disp_elem"][idx]
+        L_tube = np.linalg.norm(nodes[n2] - nodes[n1])
         FS = sy_limit / vm_val if vm_val > 1e-3 else 99.9
 
         txt = (
             f"<b>Tubo #{idx+1} (Nodos {n1}–{n2})</b><br>"
+            f"Longitud: {L_tube:.1f} mm<br>"
             f"Von Mises: {vm_val:.2f} MPa<br>"
             f"Desplazamiento: {d_val:.3f} mm<br>"
             f"Factor de Seguridad: {FS:.2f}"
@@ -621,18 +677,39 @@ def plot_chassis_3d(nodes, elements, res, mode="Von Mises (MPa)", scale_def=15.0
 # =====================================================================
 # 6. INTERFAZ PRINCIPAL Y PESTAÑAS DE PRUEBAS
 # =====================================================================
-st.title("🏎️ FSAE 2026 | Analizador Estructural 3D de Chasis")
+st.title("🏎️ FSAE 2026 | Analizador Estructural 3D de Chasis (mm)")
 st.markdown(
-    "Plataforma de verificación por **Elementos Finitos 3D** basada en el reglamento **Formula SAE® Rules 2026** "
-    "(Secciones **F.3, F.7, F.8, T.2, T.3, VE.2, IN.11**) y ensayos dinámicos de pista."
+    "Plataforma de verificación por **Elementos Finitos 3D en Milímetros (`mm`, `N`, `MPa`)** basada en el reglamento "
+    "**Formula SAE® Rules 2026** (Secciones **F.3, F.7, F.8, T.2, T.3, VE.2, IN.11**)."
 )
 
 with st.sidebar:
-    st.header("📂 1. Geometría CAD")
+    st.header("📂 1. Geometría CAD (en mm)")
     uploaded_file = st.file_uploader(
         "Subir estructura del chasis (.IGS, .IGES, .DXF)",
         type=["igs", "iges", "dxf"]
     )
+
+    unit_option = st.selectbox(
+        "Escala de coordenadas del archivo CAD:",
+        [
+            "Milímetros (mm) — Directo 1:1",
+            "Metros a Milímetros (x1000)",
+            "Centímetros a Milímetros (x10)",
+            "Pulgadas a Milímetros (x25.4)"
+        ],
+        index=0
+    )
+    scale_map = {
+        "Milímetros (mm) — Directo 1:1": 1.0,
+        "Metros a Milímetros (x1000)": 1000.0,
+        "Centímetros a Milímetros (x10)": 10.0,
+        "Pulgadas a Milímetros (x25.4)": 25.4
+    }
+    cad_scale = scale_map[unit_option]
+
+    swap_yz = st.checkbox("Mi CAD usa el Eje Y como Vertical (ej. SolidWorks)", value=False)
+    tol_mm = st.number_input("Tolerancia de unión de nodos (mm)", min_value=0.1, max_value=20.0, value=1.5, step=0.5)
 
     st.header("🔧 2. Tubería y Material (F.3.4)")
     tube_preset = st.selectbox(
@@ -679,17 +756,28 @@ if uploaded_file is not None:
     raw_text = uploaded_file.read().decode("utf-8", errors="ignore")
     ext = uploaded_file.name.lower().split(".")[-1]
     if ext == "dxf":
-        nodes, elements = parse_dxf(raw_text)
+        nodes, elements = parse_dxf(raw_text, cad_scale, swap_yz, tol_mm)
     else:
-        nodes, elements = parse_iges(raw_text)
+        nodes, elements = parse_iges(raw_text, cad_scale, swap_yz, tol_mm)
 
     if len(nodes) < 4 or len(elements) < 3:
-        st.warning("⚠️ El archivo subido no contiene suficientes entidades de línea 3D válidas. Se cargó el chasis FSAE de referencia.")
+        st.warning("⚠️ El archivo subido no contiene suficientes líneas 3D con la tolerancia actual. Se cargó el chasis FSAE de referencia en mm.")
         nodes, elements = generate_reference_fsae_chassis()
     else:
-        st.success(f"✅ Archivo **{uploaded_file.name}** procesado correctamente: **{len(nodes)} nodos** y **{len(elements)} tubos** detectados.")
+        spans_mm = np.ptp(nodes, axis=0)
+        st.success(
+            f"✅ Archivo **{uploaded_file.name}** cargado en **MILÍMETROS**: "
+            f"**{len(nodes)} nodos** y **{len(elements)} tubos** | "
+            f"Dimensiones detectadas: **Largo X = {spans_mm[0]:.1f} mm**, "
+            f"**Ancho Y = {spans_mm[1]:.1f} mm**, **Alto Z = {spans_mm[2]:.1f} mm**."
+        )
 else:
-    st.info("💡 Mostrando el **Chasis Tubular FSAE de Referencia** (34 nodos, 88 tubos). Podés subir tu propio archivo `.IGS` o `.DXF` en el panel izquierdo en cualquier momento.")
+    spans_mm = np.array([2480.0, 1040.0, 1109.0])
+    st.info(
+        "💡 Mostrando el **Chasis Tubular FSAE de Referencia en Milímetros** "
+        "(Largo: **2480 mm**, Ancho: **1040 mm**, Alto: **1109 mm**). "
+        "Subí tu archivo `.IGS` o `.DXF` en el menú izquierdo."
+    )
     nodes, elements = generate_reference_fsae_chassis()
 
 regions = identify_key_regions(nodes)
@@ -730,9 +818,9 @@ with tabs[0]:
 
     z_left = np.mean(np.abs(res_1["u_xyz"][meta_1["left_nodes"], 2]))
     z_right = np.mean(np.abs(res_1["u_xyz"][meta_1["right_nodes"], 2]))
-    z_defl = 0.5 * (z_left + z_right)
-    half_span = meta_1["lever_arm_mm"] / 2.0
-    theta_deg = max(math.degrees(math.atan(z_defl / max(half_span, 1.0))), 1e-4)
+    z_defl_mm = 0.5 * (z_left + z_right)
+    half_span_mm = meta_1["lever_arm_mm"] / 2.0
+    theta_deg = max(math.degrees(math.atan(z_defl_mm / max(half_span_mm, 1.0))), 1e-4)
     K_torsion = torque_Nm / theta_deg
     vm_max_1 = float(np.max(res_1["vm_elem"]))
     disp_max_1 = float(np.max(res_1["disp_node"]))
@@ -747,7 +835,7 @@ with tabs[0]:
         st.metric("Ángulo de Giro (θ)", f"{theta_deg:.3f} °")
         st.metric("Von Mises Máximo", f"{vm_max_1:.1f} MPa")
         st.metric("Desplazamiento Máx.", f"{disp_max_1:.2f} mm")
-        st.metric("Masa Estimada Chasis", f"{res_1['mass_kg']:.2f} kg")
+        st.metric("Masa Chasis / Long. Tubos", f"{res_1['mass_kg']:.2f} kg ({res_1['total_length_mm']/1000:.1f} m)")
 
     with col_viz:
         st.plotly_chart(plot_chassis_3d(nodes, elements, res_1, viz_mode_1, scale_def, sy_limit), use_container_width=True)
@@ -770,7 +858,7 @@ with tabs[1]:
 
     with col_ctrl:
         if vm_max_2 <= sy_limit and disp_max_2 <= 2.0:
-            st.markdown(f'<div class="status-pass">✅ PRUEBA SUPERADA: Factor de Seguridad = {fs_2:.2f} | Deformación controlada</div>', unsafe_allow_html=True)
+            st.markdown(f'<div class="status-pass">✅ PRUEBA SUPERADA: Factor de Seguridad = {fs_2:.2f} | Deformación en mm controlada</div>', unsafe_allow_html=True)
         else:
             st.markdown(f'<div class="status-fail">❌ ALERTA ESTRUCTURAL: Von Mises ({vm_max_2:.1f} MPa) o Desplazamiento ({disp_max_2:.2f} mm) exceden límites.</div>', unsafe_allow_html=True)
 
@@ -900,11 +988,4 @@ with tabs[5]:
         if vm_max_6 <= su_limit and disp_max_6 <= 25.0:
             st.markdown(f'<div class="status-pass">✅ CUMPLE FSAE F.8: Sin colapso ni intrusión > 25 mm (FS Último = {fs_6:.2f})</div>', unsafe_allow_html=True)
         else:
-            st.markdown(f'<div class="status-fail">❌ SOBREESFUERZO EN IMPACTO: {vm_max_6:.1f} MPa (Límite Último Su: {su_limit:.0f} MPa)</div>', unsafe_allow_html=True)
-
-        st.metric("Von Mises Pico Impacto", f"{vm_max_6:.1f} MPa", f"Su máx: {su_limit:.0f} MPa")
-        st.metric("Deflexión Front Bulkhead", f"{disp_max_6:.2f} mm", "Máx F.8.8.6: 25.0 mm")
-        st.metric("Área / Inercia Tubo Actual", f"{area_sec:.0f} mm² | {inertia_sec:.0f} mm⁴")
-
-    with col_viz:
-        st.plotly_chart(plot_chassis_3d(nodes, elements, res_6, viz_mode_6, max(scale_def // 4, 1), su_limit), use_container_width=True)
+            st.markdown(f'<div class="status-fail">❌ SOBREESFUERZO EN IMPACTO: {vm_max_6:.1f} MPa (Límite Último Su: {su_limit:.0
