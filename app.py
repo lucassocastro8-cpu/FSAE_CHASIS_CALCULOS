@@ -224,20 +224,12 @@ def clean_and_weld_chassis_mesh(
             nodes_arr = np.array(new_nodes, dtype=float)
             unique_edges = new_edges
 
-    # Auto-orientación inteligente del chasis FSAE:
-    # 1. El eje con mayor extensión es X (Largo longitudinal ~2430 mm)
-    # 2. Entre los otros dos ejes, el eje Lateral (Y) es simétrico respecto a la media,
-    #    mientras que el eje Vertical (Z) tiene los puntos del Main Hoop alejados de la base.
+    # Auto-orientación inteligente del chasis FSAE
     if len(nodes_arr) >= 4:
         spans = np.ptp(nodes_arr, axis=0)
         idx_long = int(np.argmax(spans))
         rem = [i for i in range(3) if i != idx_long]
 
-        # Evaluar asimetría vertical (el Main Hoop tiene pocos nodos muy altos, por lo que
-        # la distancia del promedio al extremo superior es distinta que al piso)
-         c0 = nodes_arr[:, rem[0]]
-        c1 = nodes_arr[:, rem[1]]
-        # En un chasis tubular sin pontones, Alto Z (~1100-1350 mm) > Ancho Y (~600-800 mm)
         if spans[rem[0]] >= spans[rem[1]]:
             idx_vert = rem[0]
             idx_lat = rem[1]
@@ -247,12 +239,10 @@ def clean_and_weld_chassis_mesh(
 
         nodes_arr = nodes_arr[:, [idx_long, idx_lat, idx_vert]]
 
-        # Si el usuario pide rotar 90° sobre el eje longitudinal X (intercambiar Ancho Y <-> Alto Z)
         if rot_roll_90:
             nodes_arr = nodes_arr[:, [0, 2, 1]]
 
         # Asegurar que el Main Hoop (parte superior) apunte hacia +Z (arriba)
-        # El piso del chasis tiene muchos más nodos que la punta del arco principal:
         z_vals = nodes_arr[:, 2]
         z_mid = 0.5 * (z_vals.min() + z_vals.max())
         n_below = np.sum(z_vals < z_mid)
@@ -263,7 +253,7 @@ def clean_and_weld_chassis_mesh(
         if invert_z:
             nodes_arr[:, 2] = -nodes_arr[:, 2]
 
-        # Asegurar que el Frente del auto quede en X = 0 y el Main Hoop en la mitad trasera (X > L/2)
+        # Asegurar que el Frente del auto quede en X = 0 y el Main Hoop hacia atrás
         nodes_arr[:, 2] -= nodes_arr[:, 2].min()
         top_z_nodes = np.argsort(nodes_arr[:, 2])[-3:]
         x_of_top = np.mean(nodes_arr[top_z_nodes, 0])
@@ -274,8 +264,6 @@ def clean_and_weld_chassis_mesh(
         if flip_front_rear:
             nodes_arr[:, 0] = -nodes_arr[:, 0]
 
-        # Normalizar coordenadas finales en milímetros:
-        # X desde 0 (Front Bulkhead) hacia atrás (+X), Y centrado en 0, Z desde 0 (piso) hacia arriba (+Z)
         nodes_arr[:, 0] -= nodes_arr[:, 0].min()
         nodes_arr[:, 1] -= 0.5 * (nodes_arr[:, 1].max() + nodes_arr[:, 1].min())
         nodes_arr[:, 2] -= nodes_arr[:, 2].min()
@@ -506,7 +494,6 @@ def solve_frame_3d(nodes, elements, prop_dict, fixed_dofs, nodal_loads):
         for j in range(min(len(force_vec), 6)):
             F_global[6 * node_id + j] += force_vec[j]
 
-    # Regularización mínima sin alterar la rigidez física real del chasis
     K_global += np.eye(ndof) * 1e-3
 
     free_dofs = np.setdiff1d(np.arange(ndof), np.unique(fixed_dofs))
@@ -867,7 +854,7 @@ with st.sidebar:
     cad_scale = scale_map[unit_option]
 
     st.caption("Ajuste de orientación del chasis:")
-    rot_roll_90 = st.checkbox("Rotar 90° sobre eje X (Intercambiar Ancho Y ↔ Alto Z)", value=False)
+    rot_roll_90 = st.checkbox("Rotar 90° sobre eje X (Intercambiar Y ↔ Z)", value=False)
     invert_z = st.checkbox("Invertir Arriba ↔ Abajo (Eje Z)", value=False)
     flip_front_rear = st.checkbox("Invertir Frente ↔ Atrás (Eje X)", value=False)
     tol_mm = st.number_input("Tolerancia soldadura de nodos (mm)", min_value=0.5, max_value=30.0, value=5.0, step=0.5)
