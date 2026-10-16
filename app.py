@@ -239,10 +239,7 @@ def clean_and_weld_chassis_mesh(
 
         nodes_arr = nodes_arr[:, [idx_long, idx_lat, idx_vert]]
 
-        if rot_roll_90:
-            nodes_arr = nodes_arr[:, [0, 2, 1]]
-
-        # Asegurar que el Main Hoop (parte superior) apunte hacia +Z (arriba)
+        # 1) Heurística automática: Main Hoop hacia +Z (arriba)
         z_vals = nodes_arr[:, 2]
         z_mid = 0.5 * (z_vals.min() + z_vals.max())
         n_below = np.sum(z_vals < z_mid)
@@ -250,10 +247,7 @@ def clean_and_weld_chassis_mesh(
         if n_above > n_below:
             nodes_arr[:, 2] = -nodes_arr[:, 2]
 
-        if invert_z:
-            nodes_arr[:, 2] = -nodes_arr[:, 2]
-
-        # Asegurar que el Frente del auto quede en X = 0 y el Main Hoop hacia atrás
+        # 2) Heurística automática: Frente del auto en X = 0 y Main Hoop hacia atrás (+X)
         nodes_arr[:, 2] -= nodes_arr[:, 2].min()
         top_z_nodes = np.argsort(nodes_arr[:, 2])[-3:]
         x_of_top = np.mean(nodes_arr[top_z_nodes, 0])
@@ -261,9 +255,15 @@ def clean_and_weld_chassis_mesh(
         if x_of_top < x_mid:
             nodes_arr[:, 0] = -nodes_arr[:, 0]
 
+        # 3) Ajustes manuales del usuario (aplicados DESPUÉS de la auto-orientación para no ser revertidos)
+        if rot_roll_90:
+            nodes_arr = nodes_arr[:, [0, 2, 1]]
+        if invert_z:
+            nodes_arr[:, 2] = -nodes_arr[:, 2]
         if flip_front_rear:
             nodes_arr[:, 0] = -nodes_arr[:, 0]
 
+        # 4) Normalización final de origen (X_min = 0, Y centrado en 0, Z_min = 0)
         nodes_arr[:, 0] -= nodes_arr[:, 0].min()
         nodes_arr[:, 1] -= 0.5 * (nodes_arr[:, 1].max() + nodes_arr[:, 1].min())
         nodes_arr[:, 2] -= nodes_arr[:, 2].min()
@@ -279,7 +279,7 @@ def parse_dxf(content_str, scale_factor=1.0, rot_roll_90=False, flip_front_rear=
 
     while i < n - 1:
         code = lines_list[i]
-        val = lines_list[i + 1]
+        val = lines_list[i + 1].upper()
         if code == "0" and val == "LINE":
             i += 2
             x1 = y1 = z1 = x2 = y2 = z2 = 0.0
@@ -297,6 +297,77 @@ def parse_dxf(content_str, scale_factor=1.0, rot_roll_90=False, flip_front_rear=
                     pass
                 i += 2
             raw_segments.append(([x1, y1, z1], [x2, y2, z2]))
+        elif code == "0" and val == "LWPOLYLINE":
+            i += 2
+            pts = []
+            curr_x = curr_y = None
+            curr_z = 0.0
+            closed = False
+            while i < n - 1 and lines_list[i] != "0":
+                c = lines_list[i]
+                v = lines_list[i + 1]
+                try:
+                    if c == "70":
+                        closed = (int(float(v)) & 1) != 0
+                    elif c == "38":
+                        curr_z = float(v)
+                    elif c == "10":
+                        if curr_x is not None and curr_y is not None:
+                            pts.append([curr_x, curr_y, curr_z])
+                        curr_x = float(v)
+                        curr_y = 0.0
+                    elif c == "20":
+                        curr_y = float(v)
+                except ValueError:
+                    pass
+                i += 2
+            if curr_x is not None and curr_y is not None:
+                pts.append([curr_x, curr_y, curr_z])
+            for k in range(len(pts) - 1):
+                raw_segments.append((pts[k], pts[k + 1]))
+            if closed and len(pts) >= 3:
+                raw_segments.append((pts[-1], pts[0]))
+        elif code == "0" and val == "POLYLINE":
+            i += 2
+            closed = False
+            while i < n - 1 and lines_list[i] != "0":
+                c = lines_list[i]
+                v = lines_list[i + 1]
+                try:
+                    if c == "70":
+                        closed = (int(float(v)) & 1) != 0
+                except ValueError:
+                    pass
+                i += 2
+            pts = []
+            while i < n - 1:
+                if lines_list[i] == "0":
+                    ent_next = lines_list[i + 1].upper()
+                    if ent_next == "VERTEX":
+                        i += 2
+                        vx = vy = vz = 0.0
+                        while i < n - 1 and lines_list[i] != "0":
+                            c = lines_list[i]
+                            v = lines_list[i + 1]
+                            try:
+                                if c == "10": vx = float(v)
+                                elif c == "20": vy = float(v)
+                                elif c == "30": vz = float(v)
+                            except ValueError:
+                                pass
+                            i += 2
+                        pts.append([vx, vy, vz])
+                    elif ent_next == "SEQEND":
+                        i += 2
+                        break
+                    else:
+                        break
+                else:
+                    i += 2
+            for k in range(len(pts) - 1):
+                raw_segments.append((pts[k], pts[k + 1]))
+            if closed and len(pts) >= 3:
+                raw_segments.append((pts[-1], pts[0]))
         else:
             i += 2
 
@@ -332,23 +403,54 @@ def parse_iges(content_str, scale_factor=1.0, rot_roll_90=False, flip_front_rear
                 start_cp = 7 + (A + 1) + (K + 1)
                 end_cp = start_cp + 3 * K
                 if len(parts) > end_cp + 2:
-                    x1 = float(parts[start_cp])
-                    y1 = float(parts[start_cp + 1])
-                    z1 = float(parts[start_cp + 2])
-                    x2 = float(parts[end_cp])
-                    y2 = float(parts[end_cp + 1])
-                    z2 = float(parts[end_cp + 2])
-                    raw_segments.append(([x1, y1, z1], [x2, y2, z2]))
+                    cps = []
+                    for idx_cp in range(K + 1):
+                        base = start_cp + 3 * idx_cp
+                        cps.append(np.array([
+                            float(parts[base]),
+                            float(parts[base + 1]),
+                            float(parts[base + 2])
+                        ], dtype=float))
+                    p_start, p_end = cps[0], cps[-1]
+                    chord_vec = p_end - p_start
+                    chord_len = np.linalg.norm(chord_vec)
+                    is_curved = False
+                    if K > 1 and chord_len > 1e-6:
+                        unit_chord = chord_vec / chord_len
+                        for cp_mid in cps[1:-1]:
+                            diff = cp_mid - p_start
+                            proj = np.dot(diff, unit_chord) * unit_chord
+                            dev = np.linalg.norm(diff - proj) * scale_factor
+                            if dev > tol_mm * 1.5:
+                                is_curved = True
+                                break
+                    elif K > 1 and chord_len <= 1e-6:
+                        is_curved = True
+
+                    if is_curved:
+                        for idx_cp in range(len(cps) - 1):
+                            raw_segments.append((cps[idx_cp].tolist(), cps[idx_cp + 1].tolist()))
+                    else:
+                        raw_segments.append((p_start.tolist(), p_end.tolist()))
             elif ent_type == 106 and len(parts) >= 9:
                 ip = int(float(parts[1]))
                 n_pts = int(float(parts[2]))
-                if ip == 2 and len(parts) >= 3 + 3 * n_pts:
+                if ip in (2, 12, 63) and len(parts) >= 3 + 3 * n_pts:
                     pts = []
                     for k in range(n_pts):
                         px = float(parts[3 + 3 * k])
                         py = float(parts[4 + 3 * k])
                         pz = float(parts[5 + 3 * k])
                         pts.append([px, py, pz])
+                    for k in range(len(pts) - 1):
+                        raw_segments.append((pts[k], pts[k + 1]))
+                elif ip in (1, 11) and len(parts) >= 4 + 2 * n_pts:
+                    zt = float(parts[3])
+                    pts = []
+                    for k in range(n_pts):
+                        px = float(parts[4 + 2 * k])
+                        py = float(parts[5 + 2 * k])
+                        pts.append([px, py, zt])
                     for k in range(len(pts) - 1):
                         raw_segments.append((pts[k], pts[k + 1]))
         except (ValueError, IndexError):
@@ -484,9 +586,7 @@ def solve_frame_3d(nodes, elements, prop_dict, fixed_dofs, nodal_loads):
         k_glob = T.T @ k_loc @ T
 
         dofs = [6*n1+j for j in range(6)] + [6*n2+j for j in range(6)]
-        for a in range(12):
-            for b in range(12):
-                K_global[dofs[a], dofs[b]] += k_glob[a, b]
+        K_global[np.ix_(dofs, dofs)] += k_glob
 
         elem_cache.append((n1, n2, T, k_loc, L_mm, dofs))
 
@@ -688,7 +788,24 @@ def build_test_case(test_name, nodes, regions, params):
 # =====================================================================
 # 5. RENDERIZADOR 3D INTERACTIVO CON CÁMARA ESTABILIZADA (PLOTLY)
 # =====================================================================
-def plot_chassis_3d(nodes, elements, res, mode="Von Mises (MPa)", scale_def=15.0, sy_limit=305.0):
+def format_force_label(f_mag_N):
+    if f_mag_N >= 1000.0:
+        return f"{f_mag_N / 1000.0:.2f} kN"
+    return f"{f_mag_N:.0f} N"
+
+
+def plot_chassis_3d(
+    nodes,
+    elements,
+    res,
+    mode="Von Mises (MPa)",
+    scale_def=15.0,
+    sy_limit=305.0,
+    fixed_dofs=None,
+    nodal_loads=None,
+    show_forces=True,
+    show_supports=True
+):
     u_xyz = res["u_xyz"]
     max_raw_disp = float(np.max(res["disp_node"]))
     chassis_span = float(np.max(np.ptp(nodes, axis=0)))
@@ -790,10 +907,173 @@ def plot_chassis_3d(nodes, elements, res, mode="Von Mises (MPa)", scale_def=15.0
         name="Punto Crítico Máximo"
     ))
 
-    pad = 0.12 * chassis_span
-    xr = [float(nodes[:, 0].min() - pad), float(nodes[:, 0].max() + pad)]
-    yr = [float(nodes[:, 1].min() - pad), float(nodes[:, 1].max() + pad)]
-    zr = [float(nodes[:, 2].min() - pad), float(nodes[:, 2].max() + pad)]
+    # -----------------------------------------------------------------
+    # VISUALIZACIÓN DE PUNTOS DE FIJACIÓN / APOYOS (BOUNDARY CONDITIONS)
+    # -----------------------------------------------------------------
+    if show_supports and fixed_dofs is not None and len(fixed_dofs) > 0:
+        dof_names = ["Ux", "Uy", "Uz", "Rx", "Ry", "Rz"]
+        node_constraints = {}
+        for d in fixed_dofs:
+            nid = int(d) // 6
+            comp = int(d) % 6
+            if 0 <= nid < len(nodes):
+                node_constraints.setdefault(nid, set()).add(comp)
+
+        fixed_pts_x, fixed_pts_y, fixed_pts_z, fixed_hover = [], [], [], []
+        slide_pts_x, slide_pts_y, slide_pts_z, slide_hover = [], [], [], []
+
+        for nid, comps in sorted(node_constraints.items()):
+            pos = def_nodes[nid]
+            gdl_str = ", ".join(dof_names[c] for c in sorted(comps))
+            if {0, 1, 2}.issubset(comps):
+                tipo = "Empotramiento (6 GDL)" if len(comps) == 6 else "Apoyo Fijo (Ux, Uy, Uz)"
+                fixed_pts_x.append(pos[0])
+                fixed_pts_y.append(pos[1])
+                fixed_pts_z.append(pos[2])
+                fixed_hover.append(
+                    f"<b>Nodo #{nid} — {tipo}</b><br>"
+                    f"Coord: ({nodes[nid, 0]:.0f}, {nodes[nid, 1]:.0f}, {nodes[nid, 2]:.0f}) mm<br>"
+                    f"GDL restringidos: {gdl_str}"
+                )
+            else:
+                slide_pts_x.append(pos[0])
+                slide_pts_y.append(pos[1])
+                slide_pts_z.append(pos[2])
+                slide_hover.append(
+                    f"<b>Nodo #{nid} — Apoyo Deslizante</b><br>"
+                    f"Coord: ({nodes[nid, 0]:.0f}, {nodes[nid, 1]:.0f}, {nodes[nid, 2]:.0f}) mm<br>"
+                    f"GDL restringidos: {gdl_str}"
+                )
+
+        if fixed_pts_x:
+            fig.add_trace(go.Scatter3d(
+                x=fixed_pts_x, y=fixed_pts_y, z=fixed_pts_z,
+                mode="markers",
+                marker=dict(size=7, color="#00E5FF", symbol="square", line=dict(color="#FFFFFF", width=1.5)),
+                text=fixed_hover,
+                hoverinfo="text",
+                name="Fijación: Apoyo Fijo / Empotrado"
+            ))
+
+        if slide_pts_x:
+            fig.add_trace(go.Scatter3d(
+                x=slide_pts_x, y=slide_pts_y, z=slide_pts_z,
+                mode="markers",
+                marker=dict(size=7, color="#00E676", symbol="circle", line=dict(color="#FFFFFF", width=1.5)),
+                text=slide_hover,
+                hoverinfo="text",
+                name="Fijación: Apoyo Deslizante"
+            ))
+
+    # -----------------------------------------------------------------
+    # VISUALIZACIÓN DE FUERZAS APLICADAS (FLECHAS 3D + CONOS + ETIQUETAS)
+    # -----------------------------------------------------------------
+    extra_pts = []
+    if show_forces and nodal_loads is not None:
+        active_forces = []
+        for nid, f_vec in nodal_loads.items():
+            if 0 <= int(nid) < len(nodes):
+                f_xyz = np.array(f_vec[:3], dtype=float)
+                f_mag = float(np.linalg.norm(f_xyz))
+                if f_mag > 1e-2:
+                    active_forces.append((int(nid), f_xyz, f_mag))
+
+        if active_forces:
+            max_f = max(item[2] for item in active_forces)
+            shaft_x, shaft_y, shaft_z, shaft_hover = [], [], [], []
+            cone_x, cone_y, cone_z = [], [], []
+            cone_u, cone_v, cone_w = [], [], []
+            cone_hover = []
+
+            # Agrupar vectores similares para mostrar etiquetas de magnitud limpias sin solapamiento
+            groups = {}
+            for nid, f_xyz, f_mag in active_forces:
+                p_start = def_nodes[nid]
+                u_dir = f_xyz / f_mag
+                arrow_len = chassis_span * (0.065 + 0.065 * (f_mag / max(max_f, 1e-6)))
+                p_tip = p_start + u_dir * arrow_len
+                extra_pts.append(p_tip)
+
+                lbl_mag = format_force_label(f_mag)
+                h_txt = (
+                    f"<b>Fuerza Aplicada — Nodo #{nid}</b><br>"
+                    f"Magnitud nodal: <b>{lbl_mag}</b><br>"
+                    f"Componentes: Fx={f_xyz[0]:+.1f} N, Fy={f_xyz[1]:+.1f} N, Fz={f_xyz[2]:+.1f} N"
+                )
+
+                shaft_x.extend([p_start[0], p_tip[0], None])
+                shaft_y.extend([p_start[1], p_tip[1], None])
+                shaft_z.extend([p_start[2], p_tip[2], None])
+                shaft_hover.extend([h_txt, h_txt, h_txt])
+
+                cone_len = arrow_len * 0.32
+                cone_x.append(p_tip[0])
+                cone_y.append(p_tip[1])
+                cone_z.append(p_tip[2])
+                cone_u.append(u_dir[0] * cone_len)
+                cone_v.append(u_dir[1] * cone_len)
+                cone_w.append(u_dir[2] * cone_len)
+                cone_hover.append(h_txt)
+
+                key = (round(u_dir[0], 1), round(u_dir[1], 1), round(u_dir[2], 1), round(f_mag, 0))
+                groups.setdefault(key, []).append((nid, p_tip, f_mag, f_xyz))
+
+            fig.add_trace(go.Scatter3d(
+                x=shaft_x, y=shaft_y, z=shaft_z,
+                mode="lines",
+                line=dict(color="#FFD600", width=5),
+                text=shaft_hover,
+                hoverinfo="text",
+                name="Fuerzas Aplicadas (N / kN)"
+            ))
+
+            fig.add_trace(go.Cone(
+                x=cone_x, y=cone_y, z=cone_z,
+                u=cone_u, v=cone_v, w=cone_w,
+                anchor="tip",
+                sizemode="raw",
+                sizeref=1.0,
+                colorscale=[[0, "#FFD600"], [1, "#FF9900"]],
+                showscale=False,
+                hoverinfo="text",
+                text=cone_hover,
+                name="Dirección de Fuerza",
+                showlegend=False
+            ))
+
+            lbl_x, lbl_y, lbl_z, lbl_text = [], [], [], []
+            for _, items in groups.items():
+                tips = np.array([it[1] for it in items])
+                centroid = np.mean(tips, axis=0)
+                dists = np.linalg.norm(tips - centroid, axis=1)
+                rep_idx = int(np.argmin(dists))
+                rep_tip = items[rep_idx][1]
+                single_mag = items[rep_idx][2]
+                total_group_mag = sum(it[2] for it in items)
+                if len(items) > 1:
+                    txt_label = f"{format_force_label(single_mag)}/nodo (Σ {format_force_label(total_group_mag)})"
+                else:
+                    txt_label = f"{format_force_label(single_mag)}"
+                lbl_x.append(rep_tip[0])
+                lbl_y.append(rep_tip[1])
+                lbl_z.append(rep_tip[2])
+                lbl_text.append(txt_label)
+
+            fig.add_trace(go.Scatter3d(
+                x=lbl_x, y=lbl_y, z=lbl_z,
+                mode="text",
+                text=lbl_text,
+                textposition="top center",
+                textfont=dict(color="#FFD600", size=11),
+                hoverinfo="skip",
+                showlegend=False
+            ))
+
+    pad = 0.16 * chassis_span
+    all_pts = np.vstack([nodes, def_nodes] + ([np.array(extra_pts)] if extra_pts else []))
+    xr = [float(all_pts[:, 0].min() - pad), float(all_pts[:, 0].max() + pad)]
+    yr = [float(all_pts[:, 1].min() - pad), float(all_pts[:, 1].max() + pad)]
+    zr = [float(all_pts[:, 2].min() - pad), float(all_pts[:, 2].max() + pad)]
 
     fig.update_layout(
         paper_bgcolor="#0E0E12",
@@ -884,12 +1164,15 @@ with st.sidebar:
     od_mm = col_s1.number_input("Diámetro Ext. (mm)", min_value=15.0, max_value=60.0, value=def_od, step=0.5)
     t_mm = col_s2.number_input("Espesor (mm)", min_value=0.8, max_value=5.0, value=def_t, step=0.1)
 
-    mat_criteria = st.radio(
-        "Criterio de Límite Elástico (Regla F.3.4.2)",
-        ["Acero Continuo SES (Sy = 305 MPa)", "Unión Soldada SES (Sy = 180 MPa)"],
-        index=0
+    sy_limit = st.number_input(
+        "Criterio de Límite Elástico Sy (MPa)",
+        min_value=50.0,
+        max_value=2000.0,
+        value=305.0,
+        step=5.0,
+        help="Regla F.3.4.2 FSAE: Acero continuo sin soldar Sy = 305 MPa | Unión soldada Sy = 180 MPa."
     )
-    sy_limit = 305.0 if "305" in mat_criteria else 180.0
+    st.caption("Ref. F.3.4.2: Acero continuo = 305 MPa | Soldado = 180 MPa")
     E_mpa = 200000.0
 
     st.header("⚖️ 3. Masas y Cargas")
@@ -899,6 +1182,8 @@ with st.sidebar:
 
     st.header("🎨 4. Visualización 3D")
     scale_def = st.slider("Factor de Amplificación de Deformada", 1, 100, 15)
+    show_forces_3d = st.checkbox("Mostrar Fuerzas Aplicadas (Flechas 3D)", value=True)
+    show_supports_3d = st.checkbox("Mostrar Puntos de Fijación / Apoyos", value=True)
 
 if uploaded_file is not None:
     raw_text = uploaded_file.read().decode("utf-8", errors="ignore")
@@ -983,7 +1268,11 @@ with tabs[0]:
         st.metric("Masa Chasis", f"{res_1['mass_kg']:.2f} kg ({res_1['total_length_mm']/1000:.1f} m)")
 
     with col_viz:
-        fig_1 = plot_chassis_3d(nodes, elements, res_1, viz_mode_1, scale_def, sy_limit)
+        fig_1 = plot_chassis_3d(
+            nodes, elements, res_1, viz_mode_1, scale_def, sy_limit,
+            fixed_dofs=fixed_1, nodal_loads=loads_1,
+            show_forces=show_forces_3d, show_supports=show_supports_3d
+        )
         st.plotly_chart(fig_1, use_container_width=True)
 
 # PESTAÑA 2: FRENADA
@@ -1012,7 +1301,11 @@ with tabs[1]:
         st.metric("Factor de Seguridad (FS)", f"{fs_2:.2f}")
 
     with col_viz:
-        fig_2 = plot_chassis_3d(nodes, elements, res_2, viz_mode_2, scale_def, sy_limit)
+        fig_2 = plot_chassis_3d(
+            nodes, elements, res_2, viz_mode_2, scale_def, sy_limit,
+            fixed_dofs=fixed_2, nodal_loads=loads_2,
+            show_forces=show_forces_3d, show_supports=show_supports_3d
+        )
         st.plotly_chart(fig_2, use_container_width=True)
 
 # PESTAÑA 3: ACELERACIÓN
@@ -1040,7 +1333,11 @@ with tabs[2]:
         st.metric("Factor de Seguridad (FS)", f"{fs_3:.2f}")
 
     with col_viz:
-        fig_3 = plot_chassis_3d(nodes, elements, res_3, viz_mode_3, scale_def, sy_limit)
+        fig_3 = plot_chassis_3d(
+            nodes, elements, res_3, viz_mode_3, scale_def, sy_limit,
+            fixed_dofs=fixed_3, nodal_loads=loads_3,
+            show_forces=show_forces_3d, show_supports=show_supports_3d
+        )
         st.plotly_chart(fig_3, use_container_width=True)
 
 # PESTAÑA 4: CURVA Y TILT TEST
@@ -1073,7 +1370,11 @@ with tabs[3]:
         st.metric("Factor de Seguridad (FS)", f"{fs_4:.2f}")
 
     with col_viz:
-        fig_4 = plot_chassis_3d(nodes, elements, res_4, viz_mode_4, scale_def, sy_limit)
+        fig_4 = plot_chassis_3d(
+            nodes, elements, res_4, viz_mode_4, scale_def, sy_limit,
+            fixed_dofs=fixed_4, nodal_loads=loads_4,
+            show_forces=show_forces_3d, show_supports=show_supports_3d
+        )
         st.plotly_chart(fig_4, use_container_width=True)
 
 # PESTAÑA 5: REMOLQUE
@@ -1101,7 +1402,11 @@ with tabs[4]:
         st.metric("Factor de Seguridad (FS)", f"{fs_5:.2f}")
 
     with col_viz:
-        fig_5 = plot_chassis_3d(nodes, elements, res_5, viz_mode_5, scale_def, sy_limit)
+        fig_5 = plot_chassis_3d(
+            nodes, elements, res_5, viz_mode_5, scale_def, sy_limit,
+            fixed_dofs=fixed_5, nodal_loads=loads_5,
+            show_forces=show_forces_3d, show_supports=show_supports_3d
+        )
         st.plotly_chart(fig_5, use_container_width=True)
 
 # PESTAÑA 6: IMPACTO FRONTAL Y ARNÉS
@@ -1139,5 +1444,9 @@ with tabs[5]:
         st.metric("Área / Inercia Tubo", f"{area_sec:.0f} mm² | {inertia_sec:.0f} mm⁴")
 
     with col_viz:
-        fig_6 = plot_chassis_3d(nodes, elements, res_6, viz_mode_6, max(scale_def // 4, 1), su_limit)
+        fig_6 = plot_chassis_3d(
+            nodes, elements, res_6, viz_mode_6, max(scale_def // 4, 1), su_limit,
+            fixed_dofs=fixed_6, nodal_loads=loads_6,
+            show_forces=show_forces_3d, show_supports=show_supports_3d
+        )
         st.plotly_chart(fig_6, use_container_width=True)
